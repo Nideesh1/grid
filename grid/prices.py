@@ -18,6 +18,14 @@ from pathlib import Path
 import httpx
 
 ZONE = "N.Y.C."
+ZONES = ["WEST", "GENESE", "CENTRL", "NORTH", "MHK VL", "CAPITL", "HUD VL", "MILLWD", "DUNWOD", "N.Y.C.", "LONGIL"]
+
+
+def _zone(zone: str | None) -> str:
+    z = (zone or ZONE).strip().upper()
+    if z not in ZONES:
+        raise ValueError(f"unknown NYISO zone {zone!r}; valid: {', '.join(ZONES)}")
+    return z
 BASE = "http://mis.nyiso.com/public/csv"
 DATA_DIR = Path(__file__).resolve().parent.parent / "data" / "nyiso"
 KINDS = {"rt": "realtime", "da": "damlbmp"}
@@ -81,16 +89,18 @@ def _parse(text: str, zone: str = ZONE) -> list[dict]:
     return out
 
 
-def day_ahead(d=None) -> list[dict]:
-    """Hourly day-ahead LBMP for N.Y.C. on date d: [{ts, usd_mwh}] (hour-beginning)."""
+def day_ahead(d=None, zone: str = ZONE) -> list[dict]:
+    """Hourly day-ahead LBMP for a NYISO zone (default N.Y.C.) on date d: [{ts, usd_mwh}] (hour-beginning)."""
+    z = _zone(zone)
     text = _fetch_csv("da", _as_date(d))
-    return _parse(text) if text else []
+    return _parse(text, z) if text else []
 
 
-def real_time(d=None) -> list[dict]:
-    """5-min real-time LBMP for N.Y.C. on date d: [{ts, usd_mwh}] (interval-ending)."""
+def real_time(d=None, zone: str = ZONE) -> list[dict]:
+    """5-min real-time LBMP for a NYISO zone (default N.Y.C.) on date d: [{ts, usd_mwh}] (interval-ending)."""
+    z = _zone(zone)
     text = _fetch_csv("rt", _as_date(d))
-    return _parse(text) if text else []
+    return _parse(text, z) if text else []
 
 
 def night(d=None, kind: str = "da", start_hour: int = 19, end_hour: int = 5) -> list[dict]:

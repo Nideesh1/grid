@@ -23,7 +23,26 @@ async def one(note):
     return res
 
 
+async def building():
+    """--building: 0.5 MW / 2 MWh building battery in Long Island selling above $60, then restore the old profile."""
+    from grid import profile
+
+    old = profile.get_profile()
+    try:
+        profile.save_profile({"name": "building-battery", "power_mw": 0.5, "energy_mwh": 2, "zone": "LONGIL",
+                              "sell_above": 60}, source="smoke", replace=True)
+        r = await one("storm tomorrow, keep 30% reserve")
+        profile.save_profile({"sell_above": 500}, source="smoke")
+        h = await one(None)
+        print("SMOKE", "OK" if r.get("message") and h.get("verdict") == "approve-hold" else "FAIL")
+    finally:
+        profile.save_profile(old, source="smoke-reset", replace=True)
+        print("profile restored:", profile.get_profile()["name"], profile.get_profile()["zone"])
+
+
 async def main():
+    if "--building" in sys.argv:
+        return await building()
     a = await one(None)
     b = await one("storm tomorrow, keep 30% reserve")
     c = await one("never let the battery go below 60%")

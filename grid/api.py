@@ -26,6 +26,7 @@ async def lifespan(app: FastAPI):
     # warm the Daytona sandbox in the background so the first plan does not pay for creation
     threading.Thread(target=daytona_sim.sandbox_id, daemon=True).start()
     threading.Thread(target=voice.ensure_agent, daemon=True).start()
+    threading.Thread(target=anchor.cleanup_stale, daemon=True).start()
     yield
     daytona_sim.shutdown()
 
@@ -91,6 +92,32 @@ def get_prices(date: str | None = None):
     return {"date": d.isoformat(), "zone": "N.Y.C.", "source": "NYISO public LBMP CSV (mis.nyiso.com)",
             "day_ahead": optimize.hourly_prices(da) if da else [],
             "real_time_today": optimize.hourly_prices(prices.real_time(_dt.date.today()) or [])}
+
+
+_zones_cache: dict = {"t": 0.0, "v": None}
+
+
+@app.get("/api/prices/zones")
+def get_price_zones():
+    """Latest real-time 5-min LBMP for all 11 NYISO zones (today's realtime_zone CSV), cached 60s."""
+    import csv
+    import io
+    import time as _t
+    from datetime import date as _d
+
+    if _zones_cache["v"] and _t.time() - _zones_cache["t"] < 60:
+        return _zones_cache["v"]
+    text = prices._fetch_csv("rt", _d.today()) or ""
+    latest: dict = {}
+    for row in csv.DictReader(io.StringIO(text)):
+        name = row.get("Name")
+        if name:
+            latest[name] = {"zone": name, "ptid": row.get("PTID"), "ts": row.get("Time Stamp"),
+                            "usd_mwh": float(row.get("LBMP ($/MWHr)") or 0)}
+    v = {"source": "NYISO real-time zonal LBMP (mis.nyiso.com)", "zones": list(latest.values()),
+         "ts": next(iter(latest.values()))["ts"] if latest else None}
+    _zones_cache.update(t=_t.time(), v=v)
+    return v
 
 
 @app.post("/api/plan")
@@ -227,6 +254,50 @@ def get_voice(plan_id: str):
         if not plan or not voice.synthesize(plan_id, plan["message"]):
             raise HTTPException(404, "no audio for plan")
     return FileResponse(p, media_type="audio/mpeg")
+
+
+class BatteryReq(BaseModel):
+    name: str | None = None
+    power_mw: float | None = None
+    energy_mwh: float | None = None
+    rte: float | None = None
+    start_soc_pct: float | None = None
+    end_soc_pct: float | None = None
+    min_soc_pct: float | None = None
+    max_soc_pct: float | None = None
+    cycles_per_day: float | None = None
+    degradation_usd_mwh: float | None = None
+    zone: str | None = None
+    sell_above: float | None = None
+    buy_below: float | None = None
+    note: str | None = None  # plain words, e.g. "only sell above $60", "we have 22 MWh stored right now"
+    replace: bool = False
+
+
+@app.get("/api/battery")
+def get_battery():
+    from grid import profile
+
+    return {"profile": profile.get_profile(), "default": profile.DEFAULT, "zones": profile.ZONES,
+            "history": profile.history(), "memory": memory.recall("battery", history=True)[:30]}
+
+
+@app.post("/api/battery")
+def post_battery(req: BatteryReq):
+    """Save the user's battery profile (merge; replace=true resets unspecified fields to defaults). Fields left null are
+    unchanged, except sell_above / buy_below which can be cleared with the note 'remove the price rules'."""
+    from grid import profile
+
+    upd = {k: v for k, v in req.model_dump().items() if v is not None and k not in ("note", "replace")}
+    if req.note:
+        upd.update(profile.parse_note(req.note))
+    if not upd and not req.replace:
+        raise HTTPException(422, "nothing to update")
+    try:
+        r = profile.save_profile(upd, "ui", replace=req.replace)
+    except ValueError as e:
+        raise HTTPException(422, str(e))
+    return {**r, "history": profile.history(5)}
 
 
 @app.get("/api/constraints")

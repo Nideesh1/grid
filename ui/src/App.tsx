@@ -1,6 +1,9 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import Voice from "./Voice";
 import AskTrader from "./ask/AskTrader";
+import { LiveStrip, PlayTomorrow, ProfitCalendar, SizeSlider, ZoneMap, useLive } from "./Landing";
+import { BatteryPanel, BidsTable } from "./BatteryPanel";
+import { DEFAULT, loadBattery, saveBattery, type Battery, type BatteryChange } from "./battery";
 import {
   Bar,
   BarChart,
@@ -24,6 +27,8 @@ import {
   getMemory,
   normalizePlan,
   progressFrom,
+  setMockScale,
+  streamGet,
   streamPlan,
   type Backtest,
   type BacktestDay,
@@ -67,6 +72,47 @@ export default function App() {
   const audioRef = useRef<HTMLAudioElement>(null);
   const abortRef = useRef<AbortController | null>(null);
   const refreshMemory = () => getMemory().then(setMemory);
+  const live = useLive();
+  const [battery, setBattery] = useState<Battery>(DEFAULT);
+  const [batHist, setBatHist] = useState<BatteryChange[]>([]);
+  const [batSrc, setBatSrc] = useState<"api" | "local">("local");
+  const [batSaving, setBatSaving] = useState(false);
+  const [btRunning, setBtRunning] = useState(false);
+  const [btProgress, setBtProgress] = useState<Progress | null>(null);
+
+  async function onSaveBattery(b: Battery) {
+    setBatSaving(true);
+    const r = await saveBattery(battery, b);
+    setBattery(b);
+    setBatHist(r.history);
+    setBatSrc(r.source);
+    setMockScale(b.power_mw);
+    setBatSaving(false);
+    runPlan();
+  }
+
+  async function runBacktestLive() {
+    setBtRunning(true);
+    setBtProgress(null);
+    try {
+      await streamGet("/api/backtest/stream?days=30", (e) => {
+        const pr = progressFrom(e);
+        if (pr) setBtProgress(pr);
+        if (e.kind === "backtest" && Array.isArray(e.days))
+          setBacktest({
+            days: e.days.map(backtestDay),
+            total: e.days.map(backtestDay).reduce((a: number, d: BacktestDay) => a + d.optimal, 0),
+            total_baseline: e.days.map(backtestDay).reduce((a: number, d: BacktestDay) => a + d.baseline, 0),
+          });
+      });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBtRunning(false);
+      setBtProgress(null);
+      getBacktest().then((b) => b && setBacktest(b));
+    }
+  }
 
   async function onReplanned(planId: string | undefined, summary?: unknown) {
     try {
@@ -124,7 +170,13 @@ export default function App() {
 
   useEffect(() => {
     getBacktest().then(setBacktest);
-    runPlan();
+    loadBattery().then((r) => {
+      setBattery(r.battery);
+      setBatHist(r.history);
+      setBatSrc(r.source);
+      setMockScale(r.battery.power_mw);
+      runPlan();
+    });
     return () => abortRef.current?.abort();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -160,7 +212,7 @@ export default function App() {
       <header className="masthead">
         <div className="brand">
           <span className="wordmark">GRID</span>
-          <span className="dek">AI battery trader · NYISO N.Y.C. zone · 10 MW / 40 MWh</span>
+          <span className="dek">AI battery trader · NYISO {battery.zone} zone · {battery.power_mw} MW / {battery.energy_mwh} MWh</span>
         </div>
         <nav>
           {MOCK && <span className="tag">mock data</span>}
@@ -168,11 +220,36 @@ export default function App() {
         </nav>
       </header>
 
+      <div className="top">
+        <Hero plan={plan} last30={last30} planning={planning} />
+        <BatteryPanel battery={battery} history={batHist} source={batSrc} saving={batSaving || planning} onSave={onSaveBattery} />
+      </div>
+
+      <div className="live-row">
+        <LiveStrip live={live} plan={plan} />
+        <ZoneMap live={live} />
+      </div>
+
       <StatusFeed lines={status} planning={planning} error={error} onReplan={runPlan} />
 
       {plan && (
         <main className="result" key={flash}>
-          <Hero plan={plan} last30={last30} />
+          <Rule label="Play tomorrow" />
+          {plan.hold ? (
+            <p className="hold-note">HOLD. No hour tomorrow is profitable under your rules, so the battery sits at {plan.rows[0]?.soc_pct?.toFixed(0) ?? "its current"}% and bids nothing.</p>
+          ) : (
+            <PlayTomorrow plan={plan} />
+          )}
+          <div className="split">
+            <section>
+              <Rule label="Your bids for tomorrow" />
+              <BidsTable plan={plan} raw={plan.bids} />
+            </section>
+            <section>
+              <Rule label="Scale it" />
+              <SizeSlider plan={plan} backtest={backtest} battery={battery} />
+            </section>
+          </div>
           <AskTrader />
           <Rule label={`Tomorrow, hour by hour${plan.date ? ` · ${plan.date}` : ""}`} />
           <TradeChart plan={plan} />
@@ -210,7 +287,13 @@ export default function App() {
       <MemoryPanel data={memory} />
 
       <Rule label="Backtest · last 30 days, planned on day-ahead, settled on real-time prices" />
-      <BacktestStrip data={backtest} progress={planning ? progress : null} liveDays={liveDays} />
+      <div className="bt-run">
+        <button className="link" disabled={btRunning} onClick={runBacktestLive}>
+          {btRunning ? "Simulating in Daytona..." : "Re-run 30 nights live in Daytona"}
+        </button>
+      </div>
+      <BacktestStrip data={backtest} progress={btProgress ?? (planning ? progress : null)} liveDays={liveDays} />
+      <ProfitCalendar data={backtest} />
 
       <footer className="foot">
         Prices: NYISO public LBMP, zone N.Y.C. Battery: 10 MW / 40 MWh, 85% round trip, fill 10% to 90%, at most 1 cycle per day, $8/MWh degradation.
@@ -252,13 +335,28 @@ function StatusFeed({ lines, planning, error, onReplan }: { lines: string[]; pla
   );
 }
 
-function Hero({ plan, last30 }: { plan: Plan; last30?: number }) {
+function Hero({ plan, last30, planning }: { plan: Plan | null; last30?: number; planning: boolean }) {
   return (
     <section className="hero">
-      <div className="big">
-        <span className="num">{fmtUsd(plan.profit_usd)}</span>
-        <span className="unit">profit tomorrow</span>
-      </div>
+      <p className="tagline">Buy power when the city doesn't need it. Sell it when it does.</p>
+      {plan ? (
+        plan.hold ? (
+          <div className="big">
+            <span className="num hold">HOLD</span>
+            <span className="unit">no profitable trades tomorrow under your rules</span>
+          </div>
+        ) : (
+          <div className="big">
+            <span className="num">{fmtUsd(plan.profit_usd)}</span>
+            <span className="unit">profit tomorrow</span>
+          </div>
+        )
+      ) : (
+        <div className="big">
+          <span className="num pending">$ . . .</span>
+          <span className="unit">{planning ? "the desk is planning tomorrow" : "no plan yet"}</span>
+        </div>
+      )}
       {last30 !== undefined && (
         <div className="second">
           <span className="num">{fmtUsd(last30)}</span>
@@ -267,7 +365,7 @@ function Hero({ plan, last30 }: { plan: Plan; last30?: number }) {
       )}
       <p className="src">
         vs a fixed buy-at-night / sell-at-evening rule
-        {plan.baseline_profit_usd !== undefined && (
+        {plan && plan.baseline_profit_usd !== undefined && (
           <span className="mono">
             {" "}
             · rule {fmtUsd(plan.baseline_profit_usd)} → agent {fmtUsd(plan.profit_usd)}

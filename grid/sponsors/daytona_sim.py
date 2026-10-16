@@ -146,8 +146,9 @@ import json, sys
 sys.path.insert(0, '.')
 from grid import optimize as o
 inp = json.load(open('inputs.json'))
-def arb_day(d, da, rt, reserve_pct=10, cycles=1.0):
-    b, p = o.arb_baseline(da), o.arb_optimal(da, reserve_pct, cycles)
+def arb_day(d, da, rt, reserve_pct=None, cycles=None, battery=None, sell_above=None, buy_below=None):
+    b = o.arb_baseline(da, battery=battery)
+    p = o.arb_optimal(da, reserve_pct, cycles, battery, sell_above=sell_above, buy_below=buy_below)
     sb, sp = o.arb_simulate(b, rt), o.arb_simulate(p, rt)
     return {{"date": d, "baseline_profit": sb["profit_usd"], "optimal_profit": sp["profit_usd"],
             "optimal_profit_da": p["expected_profit_usd"], "cycles": sp["cycles"],

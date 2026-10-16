@@ -21,7 +21,7 @@ from typing import Iterator
 import httpx
 from opentelemetry import trace
 
-from grid import optimize, prices
+from grid import optimize, prices, profile
 from grid.config import env, has
 from grid.sponsors import anchor, arize, daytona_sim, memory, voice
 
@@ -183,6 +183,8 @@ def _template(facts: dict) -> dict:
             f"${facts['uplift_vs_naive_usd']:,.2f} more than the naive clock rule. The Daytona simulation found "
             f"{len(o['violations'])} safety violations using {o['cycles']:.2f} cycles.")
     msg = f"Tomorrow I'll buy {buy} and sell {sell}, profit ${o['profit_usd']:,.0f}. Approve?"
+    if str(facts.get("plan_status", "ok")).startswith("hold"):
+        msg = f"Tomorrow I'll hold and not trade: {facts['plan_status'][5:].strip()}. Approve?"
     return {"explanation": expl, "message": msg}
 
 
@@ -260,7 +262,7 @@ def _windows(hours: list[dict], field: str) -> list[str]:
     return out
 
 
-DEFAULT_CONSTRAINTS = {"reserve_pct": 10.0, "cycles": 1.0, "no_discharge_before": None, "no_charge_after": None}
+DEFAULT_CONSTRAINTS = {"reserve_pct": None, "cycles": None, "no_discharge_before": None, "no_charge_after": None}
 
 
 def active_constraints() -> dict:
@@ -268,7 +270,7 @@ def active_constraints() -> dict:
     for f in memory.recall("constraint"):
         if f["key"] in c:
             v = f["value"].get("value") if isinstance(f["value"], dict) else f["value"]
-            c[f["key"]] = DEFAULT_CONSTRAINTS[f["key"]] if v is None and f["key"] in ("reserve_pct", "cycles") else v
+            c[f["key"]] = v
     return c
 
 
@@ -341,12 +343,13 @@ def run_plan(d=None, constraint_overrides: dict | None = None, prompt_version: s
         try:
             yield {"kind": "status", "text": "fetching NYISO day-ahead prices for N.Y.C."}
             with _tool("get_prices", {"date": day.isoformat(), "kind": "day-ahead"}) as sp:
-                da = prices.day_ahead(day)
-                source = f"NYISO day-ahead LBMP, zone N.Y.C., {day}"
+                bat_in, prules = profile.battery_arg(), profile.rules()
+                zone = bat_in["zone"]
+                da = prices.day_ahead(day, zone)
                 if len(da) < 20 and not d:  # tomorrow not published yet: trade today
                     day = date.today()
-                    da = prices.day_ahead(day)
-                    source = f"NYISO day-ahead LBMP, zone N.Y.C., {day}"
+                    da = prices.day_ahead(day, zone)
+                source = f"NYISO day-ahead LBMP, zone {zone}, {day}"
                 if len(da) < 20:
                     raise RuntimeError(f"no NYISO day-ahead prices for {day}")
                 hp = optimize.hourly_prices(da)
@@ -358,17 +361,19 @@ def run_plan(d=None, constraint_overrides: dict | None = None, prompt_version: s
                 cons = {**active_constraints(), **(constraint_overrides or {})}
                 changed = [c for c in memory.changes_since(24) if not c.startswith("price_forecast")][:4]
                 _set_output(sp, {"constraints": cons, "changes": changed})
-            request = {"trading_day": day.isoformat(), "zone": "N.Y.C.", "battery": "10 MW / 40 MWh", "constraints": cons,
+            request = {"trading_day": day.isoformat(), "zone": zone, "battery": bat_in, "price_rules": prules, "constraints": cons,
                        "prompt_version": prompt_version}
             root.set_attribute("input.value", json.dumps(request))
 
             yield {"kind": "status", "text": "building optimal buy/sell schedule"}
             with _tool("build_plan", cons) as sp:
-                base = optimize.arb_baseline(da)
-                opt = optimize.arb_optimal(da, reserve_pct=float(cons["reserve_pct"] or 10), cycles=float(cons["cycles"] if cons["cycles"] is not None else 1.0),
-                                           no_discharge_before=cons.get("no_discharge_before"), no_charge_after=cons.get("no_charge_after"))
+                base = optimize.arb_baseline(da, battery=bat_in)
+                opt = optimize.arb_optimal(da, reserve_pct=cons.get("reserve_pct"), cycles=cons.get("cycles"), battery=bat_in,
+                                           no_discharge_before=cons.get("no_discharge_before"), no_charge_after=cons.get("no_charge_after"),
+                                           **prules)
+                cons = {**cons, **{k: v for k, v in (opt.get("constraints") or {}).items() if v is not None}}
                 _set_output(sp, {"status": opt["status"], "expected_profit_usd": opt["expected_profit_usd"]})
-            if opt["status"] != "ok":
+            if opt["status"].startswith("infeasible"):
                 raise RuntimeError(f"optimizer: {opt['status']}")
 
             sid = daytona_sim.sandbox_id()
@@ -381,22 +386,8 @@ def run_plan(d=None, constraint_overrides: dict | None = None, prompt_version: s
 
             yield {"kind": "status", "text": "checking safety limits"}
             with _tool("check_safety") as sp:
-                bat = opt["battery"]
-                floor = min(max(bat["soc_min_pct"], float(cons["reserve_pct"] or 0)), bat["start_soc_pct"])
                 v = sim["violations"]
-                checks = [
-                    {"name": f"SOC within {floor:.0f}% to {bat['soc_max_pct']:.0f}%", "ok": not any("SOC" in x and "end" not in x for x in v),
-                     "detail": f"min {sim['min_soc']:.0f}%, max {sim['max_soc']:.0f}%"},
-                    {"name": f"at most {cons['cycles']:g} cycle per day", "ok": not any("cycles" in x for x in v),
-                     "detail": f"{sim['cycles']:.2f} cycles"},
-                    {"name": "never charge and discharge in the same hour", "ok": not any("simultaneous" in x for x in v), "detail": "0 overlaps" if not any("simultaneous" in x for x in v) else "overlap"},
-                    {"name": f"end SOC restored to {bat['end_soc_pct']:.0f}%", "ok": not any("end SOC" in x for x in v), "detail": f"end {sim['end_soc']:.1f}%"},
-                    {"name": "simulated in Daytona" if ver["where"] == "daytona" else "simulated locally (Daytona off)",
-                     "ok": not v, "detail": ver["sandbox_id"] or "local subprocess", "sandbox_id": ver["sandbox_id"]},
-                ]
-                if cons.get("no_discharge_before") is not None:
-                    checks.append({"name": f"no selling before {_fmt_h(int(cons['no_discharge_before']))}",
-                                   "ok": not any("discharge before" in x for x in v), "detail": "operator constraint"})
+                checks = _checks(sim, cons, opt["battery"], ver["where"], ver["sandbox_id"])
                 row = anchor_get(8.0) if anchor_get else None
                 if row:
                     checks.append(row)
@@ -404,7 +395,9 @@ def run_plan(d=None, constraint_overrides: dict | None = None, prompt_version: s
 
             yield {"kind": "status", "text": "drafting dispatcher message"}
             buy, sell = _windows(opt["hours"], "charge_mw"), _windows(opt["hours"], "discharge_mw")
-            facts = {"trading_day": day.isoformat(), "price_source": source, "battery": "10 MW / 40 MWh, 85% round trip",
+            facts = {"trading_day": day.isoformat(), "price_source": source, "plan_status": opt["status"],
+                     "battery": f"{bat_in['power_mw']:g} MW / {bat_in['energy_mwh']:g} MWh, {bat_in['rte']:.0%} round trip, zone {zone}",
+                     "price_rules": prules,
                      "buy_windows": buy, "sell_windows": sell,
                      "cheapest_hour": min(hp, key=lambda h: h["usd_mwh"]), "priciest_hour": max(hp, key=lambda h: h["usd_mwh"]),
                      "optimal": {k: sim[k] for k in ("profit_usd", "revenue_usd", "cost_usd", "degradation_usd", "cycles", "min_soc", "max_soc", "violations")},
@@ -423,7 +416,8 @@ def run_plan(d=None, constraint_overrides: dict | None = None, prompt_version: s
             schedule = [{"hour": h["hour"], "ts": h["ts"], "price": h["price"], "charge_mw": h["charge_mw"],
                          "discharge_mw": h["discharge_mw"], "soc_pct": h["soc_pct"]} for h in opt["hours"]]
             plan = {
-                "plan_id": plan_id, "date": day.isoformat(), "price_source": source, "prices": hp,
+                "plan_id": plan_id, "date": day.isoformat(), "price_source": source, "prices": hp, "zone": zone,
+                "battery": profile.get_profile(), "bids": optimize.to_bids(opt), "plan_status": opt["status"],
                 "schedule": schedule, "baseline_schedule": [{k: h[k] for k in ("hour", "charge_mw", "discharge_mw", "soc_pct")} for h in base["hours"]],
                 "profit_usd": sim["profit_usd"], "baseline_profit_usd": sim_base["profit_usd"],
                 "uplift_usd": facts["uplift_vs_naive_usd"], "optimal": sim, "baseline": sim_base,
@@ -491,11 +485,14 @@ def latest_plan() -> dict | None:
 def replan(constraint: str | None = None, d=None, **_ignored) -> dict:
     stored = []
     if constraint:
+        prof = apply_note(constraint, "voice")
         c = parse_constraint(constraint)
-        if not c:
+        if prof:
+            stored.append({"profile": prof})
+        if not c and not prof:
             return {"error": f"could not parse {constraint!r}; try 'keep 30% in reserve', 'only half a cycle today', "
                              "\"don't sell before 6pm\" or 'reset constraints'"}
-        for k, v in c.items():
+        for k, v in (c or {}).items():
             stored.append({"key": k, "value": v, "id": add_constraint(k, v, constraint, "voice")["id"]})
     plan = None
     for ev in run_plan(d):
@@ -513,14 +510,15 @@ def backtest_fanout(days: int = 30, on_progress=None, conc: int = 8) -> dict:
     day-ahead prices and settles on real-time hourly averages via grid.optimize (fn arb_day). Local fallback per day."""
     days_list = [date.today() - timedelta(days=days - i) for i in range(days)]
     jobs = []
+    bat_in, prules = profile.battery_arg(), profile.rules()
     for d in days_list:
-        da, rt = prices.day_ahead(d), prices.real_time(d)
+        da, rt = prices.day_ahead(d, bat_in["zone"]), prices.real_time(d, bat_in["zone"])
         if len(da) < 23 or len(rt) < 250:
             continue
         jobs.append((f"day {d.isoformat()}", "arb_day", [d.isoformat(), da, rt], {}))
     cons = active_constraints()
     for j in jobs:
-        j[3].update(reserve_pct=float(cons["reserve_pct"] or 10), cycles=float(cons["cycles"] if cons["cycles"] is not None else 1.0))
+        j[3].update(reserve_pct=cons.get("reserve_pct"), cycles=cons.get("cycles"), battery=bat_in, **prules)
     with _tracer.start_as_current_span("backtest fan-out", attributes={"grid.days": len(jobs)}):
         res = daytona_sim.fan_out(jobs, conc=conc, on_progress=on_progress)
     out, tb, to = [], 0.0, 0.0
@@ -568,11 +566,11 @@ def start_anchor():
 
 def _checks(sim: dict, cons: dict, bat: dict, where: str, sandbox_id: str | None) -> list[dict]:
     v = sim.get("violations") or []
-    floor = min(max(bat["soc_min_pct"], float(cons.get("reserve_pct") or 0)), bat["start_soc_pct"])
+    floor = min(max(bat["soc_min_pct"], float(cons.get("reserve_pct") or 0)), bat["start_soc_pct"], bat["end_soc_pct"])
     out = [
         {"name": f"SOC within {floor:.0f}% to {bat['soc_max_pct']:.0f}%", "ok": not any("SOC" in x and "end" not in x for x in v),
          "detail": f"min {sim['min_soc']:.0f}%, max {sim['max_soc']:.0f}%"},
-        {"name": f"at most {float(cons.get('cycles') if cons.get('cycles') is not None else 1):g} cycle per day",
+        {"name": f"at most {float(cons.get('cycles') if cons.get('cycles') is not None else bat['max_cycles']):g} cycle per day",
          "ok": not any("cycles" in x for x in v), "detail": f"{sim['cycles']:.2f} cycles"},
         {"name": "never charge and discharge in the same hour", "ok": not any("simultaneous" in x for x in v),
          "detail": "0 overlaps" if not any("simultaneous" in x for x in v) else "overlap"},
@@ -583,6 +581,10 @@ def _checks(sim: dict, cons: dict, bat: dict, where: str, sandbox_id: str | None
     if cons.get("no_discharge_before") is not None:
         out.append({"name": f"no selling before {_fmt_h(int(cons['no_discharge_before']))}",
                     "ok": not any("discharge before" in x for x in v), "detail": "operator constraint"})
+    if cons.get("sell_above") is not None:
+        out.append({"name": f"only sell above ${cons['sell_above']:g}/MWh", "ok": not any("below rule" in x for x in v), "detail": "price rule"})
+    if cons.get("buy_below") is not None:
+        out.append({"name": f"only buy below ${cons['buy_below']:g}/MWh", "ok": not any("above rule" in x for x in v), "detail": "price rule"})
     return out
 
 
@@ -591,9 +593,10 @@ def plan_from_desk(result: dict, anchor_get=None, speak: bool = True) -> dict:
     opt, sim = result["plan"], result["simulation"]
     day = opt["date"]
     plan_id = opt.get("plan_id") or uuid.uuid4().hex[:10]
-    da = prices.day_ahead(date.fromisoformat(day))
+    zone = (opt.get("battery") or {}).get("zone") or profile.get_profile()["zone"]
+    da = prices.day_ahead(date.fromisoformat(day), zone)
     hp = optimize.hourly_prices(da) if da else [{"ts": h["ts"], "hour": h["hour"], "usd_mwh": h["price"]} for h in opt["hours"]]
-    base = optimize.arb_baseline(da) if da else None
+    base = optimize.arb_baseline(da, battery=opt.get("battery") or profile.battery_arg()) if da else None
     sim_base = optimize.arb_simulate(base, None) if base else {"profit_usd": 0.0}
     cons = {**DEFAULT_CONSTRAINTS, **(opt.get("constraints") or {})}
     checks = _checks(sim, cons, opt["battery"], sim.get("where", "local"), sim.get("sandbox_id"))
@@ -613,7 +616,8 @@ def plan_from_desk(result: dict, anchor_get=None, speak: bool = True) -> dict:
                             prices_usd_mwh=[h["usd_mwh"] for h in hp])
     arize.annotate(arize.current_span(), evals)
     plan = {
-        "plan_id": plan_id, "date": day, "price_source": f"NYISO day-ahead LBMP, zone N.Y.C., {day}", "prices": hp,
+        "plan_id": plan_id, "date": day, "price_source": f"NYISO day-ahead LBMP, zone {zone}, {day}", "prices": hp,
+        "zone": zone, "battery": profile.get_profile(), "bids": optimize.to_bids(opt), "plan_status": opt.get("status"),
         "schedule": [{k: h[k] for k in ("hour", "ts", "price", "charge_mw", "discharge_mw", "soc_pct")} for h in opt["hours"]],
         "baseline_schedule": [{k: h[k] for k in ("hour", "charge_mw", "discharge_mw", "soc_pct")} for h in base["hours"]] if base else [],
         "profit_usd": sim["profit_usd"], "baseline_profit_usd": sim_base["profit_usd"], "uplift_usd": uplift,
@@ -639,6 +643,10 @@ async def desk_or_fast(d=None, note: str | None = None, fast: bool = False, spea
     import asyncio
 
     anchor_get = start_anchor()
+    if note:
+        changed = await asyncio.to_thread(apply_note, note, "operator")
+        if changed:
+            yield {"kind": "status", "text": "battery profile updated: " + ", ".join(f"{k}={v}" for k, v in changed.items())}
     if not fast:
         try:
             from grid.desk import stream_desk
@@ -673,7 +681,7 @@ async def desk_or_fast(d=None, note: str | None = None, fast: bool = False, spea
                 await agen.aclose()
             except Exception:  # noqa: BLE001
                 pass
-    if note:
+    if note and fast:
         c = parse_constraint(note)
         for k, v in (c or {}).items():
             add_constraint(k, v, note, "operator")
@@ -693,3 +701,12 @@ async def desk_or_fast(d=None, note: str | None = None, fast: bool = False, spea
         if ev is None:
             break
         yield ev
+
+
+def apply_note(text: str, source: str = "operator") -> dict:
+    """Battery-profile facts in an operator note ('only sell above $60', 'we have 22 MWh stored right now') are saved
+    to the profile (supersedes in memory). Returns the changed fields."""
+    upd = profile.parse_note(text or "")
+    if not upd:
+        return {}
+    return profile.save_profile(upd, source)["changed"]

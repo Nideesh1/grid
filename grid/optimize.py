@@ -303,14 +303,30 @@ _ARB_DEFAULT = {"power_mw": 10.0, "energy_mwh": 40.0, "rte": 0.85, "soc_min_pct"
                 "start_soc_pct": 50.0, "end_soc_pct": 50.0, "max_cycles": 1.0, "degradation_usd_mwh": 8.0}
 
 
+_BAT_ALIASES = {"min_soc_pct": "soc_min_pct", "max_soc_pct": "soc_max_pct", "cycles_per_day": "max_cycles"}
+
+
 def _battery_dict(battery=None) -> dict:
+    """Merge a user battery dict over the default 10 MW / 40 MWh unit. Accepts user-facing keys
+    {power_mw, energy_mwh, rte, start_soc_pct, end_soc_pct (default = start), min_soc_pct, max_soc_pct,
+    cycles_per_day, degradation_usd_mwh, zone} as well as the internal soc_min_pct/soc_max_pct/max_cycles."""
+    try:
+        from grid.battery import DEFAULT
+        out = DEFAULT.to_dict()
+    except ImportError:  # pragma: no cover
+        out = dict(_ARB_DEFAULT)
+    out.setdefault("zone", "N.Y.C.")
     if battery is None:
-        try:
-            from grid.battery import DEFAULT
-            return DEFAULT.to_dict()
-        except ImportError:  # pragma: no cover
-            return dict(_ARB_DEFAULT)
-    return battery if isinstance(battery, dict) else battery.to_dict()
+        return out
+    user = battery if isinstance(battery, dict) else battery.to_dict()
+    user = {_BAT_ALIASES.get(k, k): v for k, v in user.items() if v is not None}
+    if "start_soc_pct" in user and "end_soc_pct" not in user:
+        user["end_soc_pct"] = user["start_soc_pct"]
+    out.update(user)
+    for k in ("power_mw", "energy_mwh", "rte", "start_soc_pct", "end_soc_pct", "soc_min_pct", "soc_max_pct",
+              "max_cycles", "degradation_usd_mwh"):
+        out[k] = float(out[k])
+    return out
 
 
 def hourly_prices(prices: list[dict]) -> list[dict]:
@@ -362,20 +378,34 @@ def arb_baseline(prices: list[dict], battery=None) -> dict:
     return _arb_plan("baseline", hp, bat, {}, ch, dis, "ok")
 
 
-def arb_optimal(prices: list[dict], reserve_pct: float = 10, cycles: float = 1.0, battery=None,
-                no_discharge_before: int | None = None, no_charge_after: int | None = None) -> dict:
+def arb_optimal(prices: list[dict], reserve_pct: float | None = None, cycles: float | None = None, battery=None,
+                no_discharge_before: int | None = None, no_charge_after: int | None = None,
+                sell_above: float | None = None, buy_below: float | None = None) -> dict:
     """MILP (HiGHS) over hourly prices: max sum(d*p) - sum(c*p) - deg*d.
     s.t. soc_t = soc_{t-1} + c_t*eta - d_t/eta; max(soc_min, reserve) <= soc_t <= soc_max; soc_end = end SOC;
     sum(d_t/eta) <= cycles * energy_mwh; c_t <= P*u_t, d_t <= P*(1-u_t), u_t binary (no simultaneous charge+discharge).
     reserve_pct raises the floor (capped at the start SOC so the day stays feasible).
-    no_discharge_before=18 means "don't sell before 6pm"; no_charge_after blocks buying from that hour on."""
+    no_discharge_before=18 means "don't sell before 6pm"; no_charge_after blocks buying from that hour on.
+    sell_above: no discharge in hours priced below it; buy_below: no charge in hours priced above it.
+    reserve_pct / cycles default to the battery's min_soc_pct / cycles_per_day (10 / 1.0 for the default unit).
+    status: "ok", "hold: <reason>" (nothing worth trading, plan is all zeros), or "infeasible: <reason>"."""
     from scipy.optimize import Bounds, LinearConstraint, milp
 
     bat = _battery_dict(battery)
     hp = hourly_prices(prices)
+    reserve_pct = bat["soc_min_pct"] if reserve_pct is None else float(reserve_pct)
+    cycles = bat["max_cycles"] if cycles is None else float(cycles)
     cons = {"reserve_pct": reserve_pct, "cycles": cycles, "no_discharge_before": no_discharge_before,
-            "no_charge_after": no_charge_after}
+            "no_charge_after": no_charge_after, "sell_above": sell_above, "buy_below": buy_below}
     T = len(hp)
+    if T == 0:
+        return _arb_plan("optimal", hp, bat, cons, [], [], "infeasible: no prices for this day/zone")
+    if bat["start_soc_pct"] == bat["end_soc_pct"] and sell_above is not None and max(p["usd_mwh"] for p in hp) < sell_above:
+        return _arb_plan("optimal", hp, bat, cons, np.zeros(T), np.zeros(T),
+                         f"hold: no hours above ${sell_above:g}/MWh (max ${max(p['usd_mwh'] for p in hp):.2f})")
+    if bat["start_soc_pct"] == bat["end_soc_pct"] and buy_below is not None and min(p["usd_mwh"] for p in hp) > buy_below:
+        return _arb_plan("optimal", hp, bat, cons, np.zeros(T), np.zeros(T),
+                         f"hold: no hours below ${buy_below:g}/MWh (min ${min(p['usd_mwh'] for p in hp):.2f})")
     eta, E, P = bat["rte"] ** 0.5, bat["energy_mwh"], bat["power_mw"]
     floor_pct = min(max(bat["soc_min_pct"], reserve_pct), bat["start_soc_pct"], bat["end_soc_pct"])
     lo, hi = floor_pct / 100 * E, bat["soc_max_pct"] / 100 * E
@@ -389,6 +419,10 @@ def arb_optimal(prices: list[dict], reserve_pct: float = 10, cycles: float = 1.0
         if no_discharge_before is not None and p["hour"] < no_discharge_before:
             ub_d[i] = 0.0
         if no_charge_after is not None and p["hour"] >= no_charge_after:
+            ub_c[i] = 0.0
+        if sell_above is not None and p["usd_mwh"] < sell_above:
+            ub_d[i] = 0.0
+        if buy_below is not None and p["usd_mwh"] > buy_below:
             ub_c[i] = 0.0
     bounds = Bounds(np.concatenate([np.zeros(2 * T), np.zeros(T)]), np.concatenate([ub_c, ub_d, np.ones(T)]))
     L = np.tril(np.ones((T, T)))  # cumulative sums -> soc_t - s0
@@ -409,9 +443,31 @@ def arb_optimal(prices: list[dict], reserve_pct: float = 10, cycles: float = 1.0
     integrality = np.concatenate([np.zeros(2 * T), np.ones(T)])
     res = milp(c, constraints=constraints, bounds=bounds, integrality=integrality)
     if res.x is None:
-        return _arb_plan("optimal", hp, bat, cons, np.zeros(T), np.zeros(T), f"infeasible: {res.message}")
+        why = "the price rules and time limits leave no way to end the day at the end SOC" \
+            if bat["start_soc_pct"] != bat["end_soc_pct"] else res.message
+        return _arb_plan("optimal", hp, bat, cons, np.zeros(T), np.zeros(T), f"infeasible: {why}")
     x = np.where(np.abs(res.x) < 1e-6, 0.0, res.x)
-    return _arb_plan("optimal", hp, bat, cons, x[:T], x[T:2 * T], "ok")
+    plan = _arb_plan("optimal", hp, bat, cons, x[:T], x[T:2 * T], "ok")
+    if plan["hours"] and max(h["discharge_mw"] for h in plan["hours"]) < 1e-3 and plan["expected_profit_usd"] <= 0.005:
+        if bat["start_soc_pct"] == bat["end_soc_pct"]:
+            plan["status"] = "hold: no price spread big enough to cover losses and degradation"
+    return plan
+
+
+def to_bids(plan: dict) -> list[dict]:
+    """Day-ahead bids/offers from a plan: buys carry a max price, sells a min price.
+    price_limit = that hour's DA price, tightened by the user's buy_below / sell_above rule when set."""
+    cons = plan.get("constraints") or {}
+    bb, sa = cons.get("buy_below"), cons.get("sell_above")
+    bids = []
+    for h in plan["hours"]:
+        if h["charge_mw"] > 1e-3:
+            lim = h["price"] if bb is None else min(h["price"], bb)
+            bids.append({"hour": h["hour"], "side": "buy", "mw": round(h["charge_mw"], 3), "price_limit": round(lim, 2)})
+        elif h["discharge_mw"] > 1e-3:
+            lim = h["price"] if sa is None else max(h["price"], sa)
+            bids.append({"hour": h["hour"], "side": "sell", "mw": round(h["discharge_mw"], 3), "price_limit": round(lim, 2)})
+    return bids
 
 
 def arb_simulate(plan: dict, prices: list[dict] | None = None) -> dict:
@@ -434,6 +490,10 @@ def arb_simulate(plan: dict, prices: list[dict] | None = None) -> dict:
             v.append(f"power above {P} MW at {h['hour']:02d}:00")
         if c > 1e-6 and d > 1e-6:
             v.append(f"simultaneous charge and discharge at {h['hour']:02d}:00")
+        if cons.get("sell_above") is not None and d > 1e-6 and h["price"] < cons["sell_above"]:
+            v.append(f"sell at ${h['price']:.2f} below rule ${cons['sell_above']:g} at {h['hour']:02d}:00")
+        if cons.get("buy_below") is not None and c > 1e-6 and h["price"] > cons["buy_below"]:
+            v.append(f"buy at ${h['price']:.2f} above rule ${cons['buy_below']:g} at {h['hour']:02d}:00")
         nd = cons.get("no_discharge_before")
         if nd is not None and h["hour"] < nd and d > 1e-6:
             v.append(f"discharge before {nd:02d}:00 at {h['hour']:02d}:00")
@@ -474,7 +534,8 @@ def arb_simulate(plan: dict, prices: list[dict] | None = None) -> dict:
     }
 
 
-def arb_backtest(days: int = 30, end=None, reserve_pct: float = 10, cycles: float = 1.0) -> dict:
+def arb_backtest(days: int = 30, end=None, reserve_pct: float | None = None, cycles: float | None = None,
+                 battery=None, sell_above: float | None = None, buy_below: float | None = None) -> dict:
     """Last `days` complete days (ending yesterday): plan on day-ahead, settle on real-time hourly averages."""
     from datetime import date as _date
 
@@ -485,10 +546,12 @@ def arb_backtest(days: int = 30, end=None, reserve_pct: float = 10, cycles: floa
     tb = to = 0.0
     for i in range(days):
         d = end_d - timedelta(days=days - 1 - i)
-        da, rt = day_ahead(d), real_time(d)
+        zone = _battery_dict(battery)["zone"]
+        da, rt = day_ahead(d, zone), real_time(d, zone)
         if len(da) < 23 or len(rt) < 250:
             continue
-        b, o = arb_baseline(da), arb_optimal(da, reserve_pct, cycles)
+        b = arb_baseline(da, battery)
+        o = arb_optimal(da, reserve_pct, cycles, battery, sell_above=sell_above, buy_below=buy_below)
         sb, so = arb_simulate(b, rt), arb_simulate(o, rt)
         tb += sb["profit_usd"]
         to += so["profit_usd"]

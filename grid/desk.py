@@ -63,6 +63,44 @@ def _emit(agent: str, text: str) -> None:
         pass
 
 
+# ------------------------------------------------------------------ battery profile (bring your own battery)
+ZONE_NAMES = {"N.Y.C.": "New York City", "LONGIL": "Long Island", "HUD VL": "the Hudson Valley", "WEST": "Western NY",
+              "CAPITL": "the Capital region", "CENTRL": "Central NY", "NORTH": "the North Country",
+              "GENESE": "Genesee", "MHK VL": "the Mohawk Valley", "MILLWD": "Millwood", "DUNWOD": "Dunwoodie"}
+
+
+def _bat() -> dict:
+    from grid import profile
+
+    return profile.battery_arg()
+
+
+def _price_rules() -> dict:
+    from grid import profile
+
+    return {k: v for k, v in profile.rules().items() if v is not None}
+
+
+def _defaults() -> dict:
+    b = _bat()
+    return {"reserve_pct": float(b.get("min_soc_pct") or 10.0), "cycles": float(b.get("cycles_per_day") or 1.0),
+            "no_discharge_before": None, "no_charge_after": None}
+
+
+def _num(x: float) -> str:
+    return f"{x:,.0f}" if abs(x) >= 10 else f"{x:.1f}".rstrip("0").rstrip(".")
+
+
+def battery_line() -> str:
+    """'0.5 MW / 2 MWh battery in Long Island, now 50% charged (1 MWh); rules: sell above $60/MWh'."""
+    b, r = _bat(), _price_rules()
+    stored = b["energy_mwh"] * b["start_soc_pct"] / 100
+    line = (f"{_num(b['power_mw'])} MW / {_num(b['energy_mwh'])} MWh battery in "
+            f"{ZONE_NAMES.get(b.get('zone'), b.get('zone'))}, now {b['start_soc_pct']:.0f}% charged ({_num(stored)} MWh)")
+    rr = [f"sell above ${v:g}/MWh" if k == "sell_above" else f"buy below ${v:g}/MWh" for k, v in r.items()]
+    return line + (f"; price rules: {', '.join(rr)}" if rr else "; no price rules")
+
+
 # ------------------------------------------------------------------ data helpers
 def _tomorrow() -> str:
     return (_date.today() + timedelta(days=1)).isoformat()
@@ -74,7 +112,7 @@ def _da(day: str) -> list[dict]:
         if day not in st["prices"]:
             from grid import prices
 
-            st["prices"][day] = prices.day_ahead(day)
+            st["prices"][day] = prices.day_ahead(day, _bat().get("zone") or prices.ZONE)
         return st["prices"][day]
 
 
@@ -82,7 +120,7 @@ def _rules() -> dict:
     """Operator rules: persisted constraints (same memory the main agent uses) + desk rules + this run's note."""
     from grid.sponsors import memory
 
-    req = dict(_DEFAULTS)
+    req = _defaults()
     texts: list[str] = []
     try:
         for f in memory.recall("constraint"):
@@ -107,20 +145,31 @@ def _rules() -> dict:
     notes = []
     from grid.optimize import _battery_dict
 
-    bat = _battery_dict()
+    bat = _battery_dict(_bat())
     cap = min(bat["start_soc_pct"], bat["end_soc_pct"])
     if req["reserve_pct"] > cap:
         notes.append(f"requested {req['reserve_pct']:g}% reserve is above the {cap:g}% start/end level; enforcing {cap:g}%")
         req["reserve_pct"] = cap
-    return {"required": req, "texts": [t for t in texts if t], "notes": notes}
+    texts = list(dict.fromkeys(t for t in texts if t and "reset" not in t.lower()))
+    return {"required": req, "texts": texts, "notes": notes}
 
 
 def _parse(text: str) -> dict | None:
+    import re
+
+    out = _parse_base(text) or {}
+    m = re.search(r"(?:below|under|less than|at least|floor of|minimum of)\s*(\d+(?:\.\d+)?)\s*(%|percent)", (text or "").lower())
+    if m:
+        out["reserve_pct"] = max(float(m.group(1)), out.get("reserve_pct") or 0)
+    return out or None
+
+
+def _parse_base(text: str) -> dict | None:
     try:
         from grid.agent import parse_constraint
 
         out = parse_constraint(text)
-        if out is not None and set(out) == set(_DEFAULTS) and out == _DEFAULTS:
+        if out is not None and set(out) == set(_DEFAULTS):
             return None  # "reset" text is not a tightening rule
         return out
     except Exception:  # noqa: BLE001  (grid.agent is edited concurrently; a regex fallback keeps the desk alive)
@@ -212,7 +261,7 @@ def get_real_time_summary(days: int = 3) -> dict:
     out = []
     for i in range(days, 0, -1):
         d = _date.today() - timedelta(days=i)
-        rows = prices.real_time(d)
+        rows = prices.real_time(d, _bat().get("zone") or prices.ZONE)
         if len(rows) < 200:
             continue
         hp = hourly_prices(rows)
@@ -223,15 +272,18 @@ def get_real_time_summary(days: int = 3) -> dict:
     return {"days": out}
 
 
-def optimize(date: str | None = None, reserve_pct: float = 10, cycles: float = 1.0,
+def optimize(date: str | None = None, reserve_pct: float | None = None, cycles: float | None = None,
              no_discharge_before: int | None = None, no_charge_after: int | None = None) -> dict:
-    """Run the battery optimizer (MILP) on the day-ahead prices. You choose ONLY constraints:
-    reserve_pct (min state of charge %, 10..50), cycles (0..1 full cycles), no_discharge_before (hour 0-23, no selling
-    before it), no_charge_after (hour 0-23, no buying from it on). Returns plan_id and the plan's numbers
-    (charge/discharge hours and MW, expected profit). The optimizer alone sets every MW value."""
+    """Run the battery optimizer (MILP) on the day-ahead prices for the operator's saved battery. You choose ONLY
+    constraints: reserve_pct (min state of charge %), cycles (0..1 full cycles), no_discharge_before (hour 0-23, no
+    selling before it), no_charge_after (hour 0-23, no buying from it on). Omit them for the battery's defaults.
+    The operator's price rules (sell above / buy below) are applied automatically. Returns plan_id, status
+    ('ok' or 'hold: reason') and the plan's numbers. The optimizer alone sets every MW value."""
     day = date or _state()["date"] or _tomorrow()
-    reserve_pct = float(min(max(reserve_pct or 10, 10), 50))
-    cycles = float(min(max(cycles if cycles is not None else 1.0, 0), 1))
+    bat, d = _bat(), _defaults()
+    cap = min(bat["start_soc_pct"], bat["end_soc_pct"])
+    reserve_pct = float(min(max(d["reserve_pct"] if reserve_pct is None else reserve_pct, d["reserve_pct"]), max(cap, d["reserve_pct"])))
+    cycles = float(min(max(d["cycles"] if cycles is None else cycles, 0), d["cycles"]))
     _emit("trader", f"optimizing {day} (reserve {reserve_pct:g}%, {cycles:g} cycle"
                     + (f", no selling before {no_discharge_before:02d}:00" if no_discharge_before is not None else "")
                     + (f", no buying from {no_charge_after:02d}:00" if no_charge_after is not None else "") + ")")
@@ -240,18 +292,22 @@ def optimize(date: str | None = None, reserve_pct: float = 10, cycles: float = 1
         return {"error": f"no day-ahead prices for {day}"}
     from grid.optimize import arb_optimal
 
-    plan = arb_optimal(rows, reserve_pct=reserve_pct, cycles=cycles,
-                       no_discharge_before=no_discharge_before, no_charge_after=no_charge_after)
+    plan = arb_optimal(rows, reserve_pct=reserve_pct, cycles=cycles, battery=bat,
+                       no_discharge_before=no_discharge_before, no_charge_after=no_charge_after, **_price_rules())
     pid = "desk-" + uuid.uuid4().hex[:8]
     plan["plan_id"] = pid
     _state()["plans"][pid] = plan
     ch = [[h["hour"], h["charge_mw"], h["price"]] for h in plan["hours"] if h["charge_mw"] > 1e-6]
     dis = [[h["hour"], h["discharge_mw"], h["price"]] for h in plan["hours"] if h["discharge_mw"] > 1e-6]
-    return {"plan_id": pid, "date": plan["date"], "status": plan["status"], "constraints": plan["constraints"],
-            "buy_window": _windows([c[0] for c in ch]), "sell_window": _windows([d[0] for d in dis]),
-            "mwh_bought": round(sum(c[1] for c in ch)), "mwh_sold": round(sum(d[1] for d in dis)),
-            "profit": f"${plan['expected_profit_usd']:,.0f}",
-            "reserve": f"{plan['constraints']['reserve_pct']:g}%"}
+    out = {"plan_id": pid, "date": plan["date"], "status": plan["status"], "battery": battery_line(),
+           "constraints": plan["constraints"], "reserve": f"{plan['constraints']['reserve_pct']:g}%"}
+    if str(plan["status"]).startswith("hold"):
+        out["hold_reason"] = plan["status"].split(":", 1)[-1].strip()
+        _emit("trader", f"HOLD, {out['hold_reason']}")
+        return out
+    return {**out, "buy_window": _windows([c[0] for c in ch]), "sell_window": _windows([x[0] for x in dis]),
+            "mwh_bought": _num(sum(c[1] for c in ch)), "mwh_sold": _num(sum(x[1] for x in dis)),
+            "profit": f"${plan['expected_profit_usd']:,.0f}"}
 
 
 def _simulate(plan_id: str, agent: str) -> dict:
@@ -301,12 +357,12 @@ def market_brief(day: str) -> str:
     """market-analyst as a plain tool call: day-ahead shape + recent real-time volatility in 3 lines."""
     da = get_day_ahead(day)
     if da.get("error"):
-        return f"No day-ahead prices for {day}."
+        return f"Your {battery_line()}. No day-ahead prices for {day}."
     rt = get_real_time_summary(3)["days"]
     lo = _windows(sorted(h for h, _ in da["cheapest_4"]))
     hi = _windows(sorted(h for h, _ in da["priciest_4"]))
     rt_sd = round(statistics.mean(d["stdev"] for d in rt), 1) if rt else None
-    return (f"Day-ahead {day}: cheapest {lo} (${da['min']:.0f}), priciest {hi} (${da['max']:.0f}), "
+    return (f"Your {battery_line()}. Day-ahead {day}: cheapest {lo} (${da['min']:.0f}), priciest {hi} (${da['max']:.0f}), "
             f"spread ${da['spread']:.0f}/MWh, stdev ${da['stdev']:.0f}. "
             + (f"Recent real-time hourly stdev ${rt_sd}/MWh over {len(rt)} days." if rt else ""))
 
@@ -341,7 +397,7 @@ def record_verdict(plan_id: str, decision: str, reason: str, cited_violations: l
          "sim_violations": sim["violations"], "forced_veto": forced}
     _state()["verdicts"].append(v)
     if decision == "veto":
-        why = (sim["violations"] or [reason])[0].removeprefix("rule: ")
+        why = (sim["violations"] or [reason])[0].removeprefix("rule: ")[:120]
         _emit("risk-officer", f"VETO, {why}, asking trader to replan")
     else:
         _emit("risk-officer", f"APPROVE, {sim['profit_usd']:,.0f} dollars, {len(sim['violations'])} violations")
@@ -366,16 +422,18 @@ Delegate with the `task` tool; do not use todos or files. Keep task descriptions
 Finish with one line: FINAL plan_id=<id> verdict=<approve|veto>. Never invent numbers."""
 
 TRADER_PROMPT = """You are trader. Call optimize with constraints only; the optimizer sets every MW value.
-Defaults reserve_pct=10, cycles=1 unless you were given constraints. Then call publish_message(plan_id, text) with
+Omit reserve_pct/cycles (battery defaults) unless you were given constraints. Then call publish_message(plan_id, text) with
 at most 2 plain-English sentences for a stage demo, copied from the optimize result fields, like:
-"Tomorrow we buy 43 MWh from 2 to 5am and noon to 3pm and sell 37 MWh from 6 to 8am and 5 to 7pm, for $418 profit.
-We keep a 30% reserve and never exceed one cycle." Use buy_window/sell_window/mwh/profit/reserve verbatim.
+"Your 0.5 MW building battery in Long Island buys 2 MWh from 2 to 5am and sells 1.7 MWh from 5 to 7pm, for $41
+profit tomorrow. It keeps a 30% reserve and only sells above $60." Use battery/buy_window/sell_window/mwh/profit/
+reserve verbatim (size and zone from `battery`, mention price rules if any). If status starts with "hold", say the
+battery holds tomorrow and give hold_reason in plain words (e.g. "no hour tops your $200 sell price"), 1-2 sentences.
 No hour codes, no decimals, no em dashes. Reply with plan_id and profit in one line."""
 
 RISK_PROMPT = """You are risk-officer. Call simulate(plan_id) and recall_rules() in parallel. If the simulation's
 violations list is non-empty you MUST veto: cited_violations = those exact strings, and reason = the tighter
-constraints to replan with, taken from recall_rules `required` (e.g. "replan with reserve_pct=30"). Otherwise approve.
-Call record_verdict once. Reply in one line: decision, plan_id, constraints to replan with (if veto).
+constraints to replan with, taken from recall_rules `required` (e.g. "replan with reserve_pct=30"). Otherwise approve (a "hold" plan with no violations is approved).
+`notes` are informational only (e.g. a floor above 50% is enforced as 50%); judge by the violations list. Call record_verdict once. Reply in one line: decision, plan_id, constraints to replan with (if veto).
 Only call remember_rule if the operator explicitly asks to remember a rule for the future."""
 
 
@@ -432,13 +490,15 @@ def _result(st: dict, messages: list, t0: float) -> dict:
     verdict = final["decision"] if final else "veto"
     if sim and sim["violations"]:
         verdict = "veto"
+    if verdict == "approve" and plan and str(plan.get("status", "")).startswith("hold"):
+        verdict = "approve-hold"
     msg = st["messages"].get(pid) or (list(st["messages"].values())[-1] if st["messages"] else "")
     steps = [{"agent": "market-analyst", "summary": st.get("brief", "")}] + _steps(messages)
     lead = messages[-1].content if messages else ""
     if isinstance(lead, list):
         lead = " ".join(x.get("text", "") for x in lead if isinstance(x, dict))
     steps.append({"agent": "desk-lead", "summary": " ".join(str(lead).split())[:300]})
-    return {"message": msg, "plan": plan, "simulation": sim, "verdict": verdict,
+    return {"message": msg, "plan": plan, "battery": battery_line(), "simulation": sim, "verdict": verdict,
             "verdict_detail": final, "verdicts": st["verdicts"], "steps": steps, "date": st["date"],
             "operator_note": st["note"], "elapsed_s": round(time.time() - t0, 2)}
 

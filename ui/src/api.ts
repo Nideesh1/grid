@@ -18,6 +18,8 @@ export type Plan = {
   revenue_usd?: number;
   cost_usd?: number;
   backtest_total_usd?: number;
+  degradation_usd?: number;
+  mwh_discharged?: number;
   cycles?: number;
   min_soc?: number;
   max_soc?: number;
@@ -25,6 +27,8 @@ export type Plan = {
   reserve_pct?: number;
   violations: number;
   status?: string;
+  hold: boolean;
+  bids?: unknown;
   sandbox?: string; // Daytona sandbox id, or undefined = local
   checks: Check[];
   audio_url?: string;
@@ -132,6 +136,8 @@ export function normalizePlan(ev: any): Plan {
     revenue_usd: pick(ev, ["revenue_usd", "optimal.revenue_usd", "sim.revenue_usd"]),
     cost_usd: pick(ev, ["cost_usd", "optimal.cost_usd", "sim.cost_usd"]),
     backtest_total_usd: pick(ev, ["backtest_total_usd", "backtest.total", "backtest.optimal_profit", "backtest.totals.optimal_profit", "last30_usd", "profit_30d_usd"]),
+    degradation_usd: pick(ev, ["degradation_usd", "optimal.degradation_usd", "sim.degradation_usd"]),
+    mwh_discharged: pick(ev, ["mwh_discharged", "optimal.mwh_discharged", "sim.mwh_discharged"]),
     cycles,
     min_soc: minSoc,
     max_soc: maxSoc,
@@ -139,6 +145,8 @@ export function normalizePlan(ev: any): Plan {
     reserve_pct: reserve,
     violations,
     status: ev.status,
+    hold: /hold/i.test(String(ev.verdict ?? ev.action ?? "")) || (rows.length > 0 && rows.every((r) => r.charge_mw < 1e-6 && r.discharge_mw < 1e-6)),
+    bids: ev.bids ?? ev.optimal?.bids,
     sandbox: local ? undefined : sandbox,
     checks,
     audio_url: audioFrom(ev),
@@ -204,25 +212,26 @@ export function progressFrom(e: any): Progress | null {
   return null;
 }
 
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+let mockScale = 1;
+export function setMockScale(powerMw: number) {
+  mockScale = powerMw / 10;
+}
+function scaleMock(e: any): any {
+  if (e.kind !== "plan" || mockScale === 1) return e;
+  const k = mockScale;
+  return {
+    ...e,
+    schedule: e.schedule.map((r: any) => ({ ...r, charge_mw: r.charge_mw * k, discharge_mw: r.discharge_mw * k })),
+    profit_usd: e.profit_usd * k,
+    revenue_usd: e.revenue_usd * k,
+    cost_usd: e.cost_usd * k,
+    baseline_profit_usd: e.baseline_profit_usd * k,
+    backtest_total_usd: e.backtest_total_usd * k,
+  };
+}
 
-/** POST /api/plan and stream SSE events. */
-export async function streamPlan(onEvent: (e: StreamEvent) => void, signal?: AbortSignal): Promise<void> {
-  if (MOCK) {
-    for (const e of mockPlanEvents) {
-      await sleep(e.kind === "status" ? 260 : e.kind === "backtest" ? 60 : 150);
-      if (signal?.aborted) return;
-      onEvent(e as StreamEvent);
-    }
-    return;
-  }
-  const r = await fetch(`${API}/api/plan`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", Accept: "text/event-stream" },
-    body: JSON.stringify({}),
-    signal,
-  });
-  if (!r.ok || !r.body) throw new Error(`plan request failed: HTTP ${r.status}`);
+async function readSSE(r: Response, onEvent: (e: StreamEvent) => void) {
+  if (!r.ok || !r.body) throw new Error(`HTTP ${r.status}`);
   const reader = r.body.getReader();
   const dec = new TextDecoder();
   let buf = "";
@@ -247,6 +256,42 @@ export async function streamPlan(onEvent: (e: StreamEvent) => void, signal?: Abo
       }
     }
   }
+}
+
+/** GET an SSE endpoint (e.g. /api/backtest/stream). */
+export async function streamGet(path: string, onEvent: (e: StreamEvent) => void, signal?: AbortSignal): Promise<void> {
+  if (MOCK) {
+    for (let i = 1; i <= 30; i++) {
+      await sleep(70);
+      if (signal?.aborted) return;
+      onEvent({ kind: "status", text: `night ${i}/30 simulated in sandbox sbx-${(4096 + i * 77).toString(16)}`, i, n: 30, sandbox_id: `sbx-${(4096 + i * 77).toString(16)}` });
+    }
+    onEvent({ kind: "backtest", ...(mockBacktest as any) });
+    onEvent({ kind: "done" });
+    return;
+  }
+  await readSSE(await fetch(`${API}${path}`, { headers: { Accept: "text/event-stream" }, signal }), onEvent);
+}
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/** POST /api/plan and stream SSE events. */
+export async function streamPlan(onEvent: (e: StreamEvent) => void, signal?: AbortSignal): Promise<void> {
+  if (MOCK) {
+    for (const e of mockPlanEvents) {
+      await sleep(e.kind === "status" ? 260 : e.kind === "backtest" ? 60 : 150);
+      if (signal?.aborted) return;
+      onEvent(scaleMock(e) as StreamEvent);
+    }
+    return;
+  }
+  const r = await fetch(`${API}/api/plan`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Accept: "text/event-stream" },
+    body: JSON.stringify({}),
+    signal,
+  });
+  await readSSE(r, onEvent);
 }
 
 export async function approve(planId: string | undefined, approved: boolean): Promise<any> {

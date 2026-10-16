@@ -112,6 +112,10 @@ def _triple(f: dict) -> dict:
     if f["kind"] == "price_forecast":
         return {"entity": {"type": "zone", "name": "NYISO N.Y.C."}, "key": f"da_price_{k[:13]}",
                 "value": f"{v.get('usd_mwh')}", "source_clause": f"day-ahead LBMP {k} = ${v.get('usd_mwh')}/MWh"}
+    if f["kind"] == "battery":
+        name, _, field = k.partition(":")
+        return {"entity": {"type": "battery", "name": name}, "key": field, "value": str(v.get("value") if isinstance(v, dict) else v),
+                "source_clause": (v.get("text") if isinstance(v, dict) else None) or f"{name} {field} = {v}"}
     if f["kind"] == "plan":
         return {"entity": {"type": "plan", "name": f"trading day {k}"}, "key": "status",
                 "value": f"{v.get('status')} plan {v.get('plan_id')} profit ${v.get('profit_usd', v.get('tonight_usd'))}",

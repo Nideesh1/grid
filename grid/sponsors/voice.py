@@ -62,7 +62,8 @@ AGENT_PROMPT = (
     "by tools: buy and sell windows, profit in dollars, the naive-rule profit, cycles, safety violations, the Daytona "
     "sandbox. Pitch it like: 'Tomorrow I'll buy 2 to 5am and sell 5 to 8pm, profit 418 dollars. Approve?' If the "
     "dispatcher gives a constraint such as 'keep 30 percent in reserve for the storm', 'only half a cycle today', "
-    "'don't sell before 6pm' or 'reset constraints', call replan with their words, wait, then read back the new profit "
+    "'don't sell before 6pm', 'only sell above 60 dollars', 'we have 22 megawatt-hours stored right now' or 'reset "
+    "constraints', call replan with their words, wait, then read back the new profit "
     "and safety result. When they clearly approve, call approve with the latest plan_id and approved true; if they "
     "reject, approved false. Keep turns under 30 words, plain spoken English, no lists."
 )
@@ -72,7 +73,7 @@ CLIENT_TOOLS = [
      "description": "Get the latest battery trading plan: plan_id, buy and sell windows, profit, naive-rule profit, cycles, violations, sandbox id.",
      "parameters": {"type": "object", "properties": {}, "required": []}},
     {"type": "client", "name": "replan", "expects_response": True, "response_timeout_secs": 40,
-     "description": "Re-plan with an operator constraint in plain words: reserve percent, cycle limit, no selling before an hour, no buying after an hour, or reset.",
+     "description": "Re-plan with an operator note in plain words: reserve percent, cycle limit, no selling before an hour, no buying after an hour, price rules (only sell above $X, only buy below $Y), current stored energy (MWh) or battery size, or reset.",
      "parameters": {"type": "object", "required": ["constraint"], "properties": {
          "constraint": {"type": "string", "description": "e.g. 'keep 30% in reserve for the storm', 'only half a cycle today', \"don't sell before 6pm\", 'reset constraints'"}}}},
     {"type": "client", "name": "approve", "expects_response": True, "response_timeout_secs": 20,
