@@ -48,12 +48,30 @@ def _sandbox():
     from daytona import Daytona, DaytonaConfig
 
     _state["client"] = Daytona(DaytonaConfig(api_key=env("DAYTONA_API_KEY")))
-    try:  # never auto-stop while the API is up (Daytona stops idle sandboxes after 15 min by default)
-        from daytona import CreateSandboxFromSnapshotParams
+    labels = {"app": "grid", "role": "verify"}
+    sb = None
+    try:  # reuse the one labeled verification sandbox across API restarts instead of piling up new ones
+        from daytona import ListSandboxesQuery
 
-        sb = _state["client"].create(CreateSandboxFromSnapshotParams(language="python", auto_stop_interval=0))
-    except Exception:  # noqa: BLE001
-        sb = _state["client"].create()
+        found = _state["client"].list(ListSandboxesQuery(labels=labels))
+        for cand in list(getattr(found, "items", found)):
+            if sb is None:
+                sb = cand
+                if not str(getattr(sb, "state", "")).lower().endswith("started"):
+                    sb.start(timeout=60)
+            else:
+                _state["client"].delete(cand)  # extras from older runs
+    except Exception as e:  # noqa: BLE001
+        log.info("no reusable daytona sandbox (%s)", type(e).__name__)
+        sb = None
+    if sb is None:
+        try:  # never auto-stop while the API is up (Daytona stops idle sandboxes after 15 min by default)
+            from daytona import CreateSandboxFromSnapshotParams
+
+            sb = _state["client"].create(CreateSandboxFromSnapshotParams(language="python", auto_stop_interval=0,
+                                                                          labels=labels))
+        except Exception:  # noqa: BLE001
+            sb = _state["client"].create()
     sb.process.exec("mkdir -p grid && touch grid/__init__.py")
     _state["sandbox"] = sb
     log.info("daytona sandbox %s created", sb.id)
