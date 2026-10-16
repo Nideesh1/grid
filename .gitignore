@@ -6,3 +6,6 @@ dist/
 data/
 *.log
 .DS_Store
+.agents/
+.claude/
+skills-lock.json

@@ -23,7 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from opentelemetry import trace  # noqa: E402
 
-from grid.config import DATA, has, setup_tracing  # noqa: E402
+from grid.config import DATA, setup_tracing  # noqa: E402
 
 OUT = DATA / "arize_loop"
 JUDGE = ("You grade a night-shift energy dispatcher message for an electric bus depot. It is CLEAR_AND_COMPLETE if it "
@@ -47,8 +47,16 @@ def rule_judge(text: str) -> dict:
 def llm_judge(text: str) -> dict:
     from grid import agent
 
-    for name, fn, key in (("mistral", agent._mistral, "MISTRAL_API_KEY"), ("anthropic", agent._anthropic, "ANTHROPIC_API_KEY")):
-        if not has(key):
+    def bedrock_judge(sys_, u):
+        try:
+            return agent._bedrock_call(sys_, u, agent.BEDROCK_JUDGE)
+        except Exception:  # noqa: BLE001  (Haiku may not be enabled in the account: use the dispatcher model)
+            return agent._bedrock_call(sys_, u)
+
+    fns = {"bedrock": bedrock_judge, "mistral": agent._mistral, "anthropic": agent._anthropic}
+    for name in agent._chain():
+        fn = fns.get(name)
+        if fn is None:
             continue
         try:
             raw, _ = fn(JUDGE, text)

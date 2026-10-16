@@ -46,6 +46,12 @@ def setup(project: str = PROJECT) -> bool:
             _state["instrumented"] = True
         except Exception as e:  # noqa: BLE001  (SDK v3 layout may not be supported; manual LLM spans cover it)
             log.info("mistral auto-instrumentation unavailable (%s); using manual OpenInference spans", type(e).__name__)
+        try:
+            from openinference.instrumentation.bedrock import BedrockInstrumentor
+
+            BedrockInstrumentor().instrument(tracer_provider=tp)
+        except Exception as e:  # noqa: BLE001
+            log.info("bedrock auto-instrumentation unavailable (%s)", type(e).__name__)
         log.info("arize tracing enabled, project=%s", project)
         return True
     except Exception as e:  # noqa: BLE001
@@ -54,12 +60,14 @@ def setup(project: str = PROJECT) -> bool:
         return False
 
 
-DOLLARS = re.compile(r"\$\s?([0-9][0-9,]*(?:\.[0-9]+)?)\s*(k|K|thousand)?")
+DOLLARS = re.compile(r"\$\s?([0-9][0-9,]*(?:\.[0-9]+)?)\s*(k|K|thousand)?(\s*(?:/|per)\s*MWh)?", re.I)
 
 
-def dollar_figures(text: str) -> list[float]:
+def dollar_figures(text: str, per_mwh: bool = False) -> list[float]:
     out = []
     for m in DOLLARS.finditer(text or ""):
+        if bool(m.group(3)) != per_mwh:
+            continue
         v = float(m.group(1).replace(",", ""))
         if m.group(2):
             v *= 1000
@@ -67,7 +75,7 @@ def dollar_figures(text: str) -> list[float]:
     return out
 
 
-def eval_plan(message: str, sim: dict, savings: dict, tol: float = 1.0) -> dict:
+def eval_plan(message: str, sim: dict, savings: dict, tol: float = 1.0, prices_usd_mwh: list[float] | None = None) -> dict:
     """Code evals. constraint_check: simulate violations == 0. grounded_savings: every $ figure in the message
     matches a number the tools produced (within tol, or rounding to the nearest $10/$100 for spoken figures)."""
     viol = sim.get("violations") or []
@@ -79,6 +87,10 @@ def eval_plan(message: str, sim: dict, savings: dict, tol: float = 1.0) -> dict:
         return any(abs(f - a) <= tol or (f >= 100 and abs(f - a) <= max(tol, 0.05 * abs(a)) and f % 10 == 0) for a in allowed)
 
     bad = [f for f in figs if not ok(f)]
+    # $/MWh figures must be prices the tools fetched (within $0.01, or rounded to the dollar)
+    for f in dollar_figures(message, per_mwh=True):
+        if not any(abs(f - p) <= 0.51 for p in (prices_usd_mwh or []) + [sim.get("avg_usd_mwh") or -1e9]):
+            bad.append(f)
     claims_safe = bool(re.search(r"\b(no|zero|0)\s+(safety\s+)?violations?\b|all (buses|40 buses)", message or "", re.I))
     return {
         "constraint_check": {"label": "pass" if not viol else "fail", "score": 1.0 if not viol else 0.0,

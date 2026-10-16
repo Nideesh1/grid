@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 import uuid
 from contextlib import contextmanager
@@ -23,7 +24,7 @@ from opentelemetry import trace
 from grid import optimize, prices
 from grid.config import env, has
 from grid.depot import apply_constraint, make_depot
-from grid.sponsors import arize, daytona_sim, memory, voice
+from grid.sponsors import anchor, arize, daytona_sim, memory, voice
 
 log = logging.getLogger("grid.agent")
 _tracer = trace.get_tracer("grid.agent")
@@ -83,9 +84,73 @@ def _set_output(sp, value) -> None:
 
 
 # ------------------------------------------------------------------ LLM
+BEDROCK_FALLBACK = ["us.anthropic.claude-sonnet-5-5", "us.anthropic.claude-sonnet-5",
+                    "us.anthropic.claude-sonnet-4-5-20250929-v1:0"]
+BEDROCK_JUDGE = "us.anthropic.claude-haiku-5-5"
+_bedrock: dict = {"model": None, "candidates": None}
+
+
+def _chain() -> list[str]:
+    out = []
+    if has("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"):
+        out.append("bedrock")
+    if has("MISTRAL_API_KEY"):
+        out.append("mistral")
+    if has("ANTHROPIC_API_KEY"):
+        out.append("anthropic")
+    return out + ["template"]
+
+
 def llm_status() -> dict:
-    prov = "mistral" if has("MISTRAL_API_KEY") else "anthropic" if has("ANTHROPIC_API_KEY") else "template"
-    return {"configured": prov, "last_provider": _llm_state["provider"], "error": _llm_state["error"]}
+    return {"configured": _chain()[0], "chain": _chain(), "last_provider": _llm_state["provider"],
+            "bedrock_model": _bedrock["model"], "error": _llm_state["error"]}
+
+
+def _boto(service: str):
+    import boto3
+
+    return boto3.client(service, region_name=env("AWS_REGION", "us-east-1"), aws_access_key_id=env("AWS_ACCESS_KEY_ID"),
+                        aws_secret_access_key=env("AWS_SECRET_ACCESS_KEY"), aws_session_token=env("AWS_SESSION_TOKEN"))
+
+
+def _bedrock_candidates() -> list[str]:
+    """Newest Claude Sonnet inference profiles in the region first, then a static fallback list."""
+    if _bedrock["candidates"] is None:
+        found: list[str] = []
+        try:
+            if not env("BEDROCK_DISCOVER"):
+                raise RuntimeError("discovery off")
+            r = _boto("bedrock").list_inference_profiles(maxResults=1000)
+            ids = [p["inferenceProfileId"] for p in r.get("inferenceProfileSummaries", [])]
+            found = sorted((i for i in ids if "anthropic.claude" in i and "sonnet" in i and i.startswith(("us.", "global."))),
+                           key=lambda i: re.sub(r"[^0-9]", "", i.split("sonnet")[-1])[:8] or "0", reverse=True)
+        except Exception as e:  # noqa: BLE001
+            log.info("bedrock list_inference_profiles unavailable: %s", type(e).__name__)
+        _bedrock["candidates"] = list(dict.fromkeys(([env("BEDROCK_MODEL_ID")] if env("BEDROCK_MODEL_ID") else []) + found + BEDROCK_FALLBACK))
+    return [m for m in _bedrock["candidates"] if m]
+
+
+def _bedrock_call(system: str, user: str, model: str | None = None) -> tuple[str, dict]:
+    c = _boto("bedrock-runtime")
+    cands = [model] if model else [_bedrock["model"]] if _bedrock["model"] else _bedrock_candidates()
+    last: Exception | None = None
+    for mid in cands:
+        try:
+            r = c.converse(modelId=mid, system=[{"text": system}],
+                           messages=[{"role": "user", "content": [{"text": user + "\nReturn only the JSON object."}]}],
+                           inferenceConfig={"maxTokens": 1500})
+            if not model:
+                _bedrock["model"] = mid
+            u = r.get("usage", {})
+            return "".join(b.get("text", "") for b in r["output"]["message"]["content"]), {"in": u.get("inputTokens"), "out": u.get("outputTokens")}
+        except Exception as e:  # noqa: BLE001
+            last = e
+            if _bedrock["model"]:
+                _bedrock["model"] = None
+            code = getattr(e, "response", {}).get("Error", {}).get("Code", "") if hasattr(e, "response") else ""
+            if code not in ("ValidationException", "AccessDeniedException", "ResourceNotFoundException"):
+                raise
+    raise last or RuntimeError("no bedrock model")
 
 
 def _mistral(system: str, user: str) -> tuple[str, dict]:
@@ -128,9 +193,11 @@ def draft(facts: dict, prompt_version: str = DEFAULT_PROMPT) -> dict:
     """LLM explanation + dispatcher message from tool facts. Provider chain: Mistral -> Anthropic -> template."""
     system = PROMPTS.get(prompt_version, PROMPTS[DEFAULT_PROMPT])
     user = json.dumps(facts, default=str)
-    chain = [(n, f) for n, f, k in (("mistral", _mistral, "MISTRAL_API_KEY"), ("anthropic", _anthropic, "ANTHROPIC_API_KEY")) if has(k)]
+    fns = {"bedrock": _bedrock_call, "mistral": _mistral, "anthropic": _anthropic}
+    chain = [(n, fns[n]) for n in _chain() if n in fns]
     for name, fn in chain:
-        model = env("MISTRAL_MODEL", "mistral-large-4") if name == "mistral" else env("ANTHROPIC_MODEL", "claude-sonnet-4-5")
+        model = {"bedrock": _bedrock["model"] or "claude-sonnet (bedrock)", "mistral": env("MISTRAL_MODEL", "mistral-large-4"),
+                 "anthropic": env("ANTHROPIC_MODEL", "claude-sonnet-4-5")}[name]
         try:
             import agentglow
 
@@ -226,6 +293,25 @@ def run_plan(d=None, cap_kw: float | None = None, prompt_version: str = DEFAULT_
             "openinference.span.kind": "AGENT", "agent.name": "dispatcher", "grid.plan_id": plan_id,
             "input.value": json.dumps(request), "input.mime_type": "application/json",
             "session.id": plan_id}) as root:
+        anchor_box: dict = {}
+        anchor_t = None
+        if anchor.enabled():
+            import threading
+
+            from opentelemetry import context as otel_ctx
+
+            ctx = otel_ctx.get_current()
+
+            def _anchor():
+                tok = otel_ctx.attach(ctx)
+                try:
+                    with _tool("anchor_cross_check", {"source": "NYISO public RT CSV in cloud browser"}):
+                        anchor_box["row"] = anchor.cross_check_price()
+                finally:
+                    otel_ctx.detach(tok)
+
+            anchor_t = threading.Thread(target=_anchor, daemon=True)
+            anchor_t.start()
         try:
             yield {"kind": "status", "text": "fetching NYISO day-ahead prices for N.Y.C."}
             with _tool("get_prices", {"date": night.isoformat(), "kind": kind}) as sp:
@@ -246,6 +332,9 @@ def run_plan(d=None, cap_kw: float | None = None, prompt_version: str = DEFAULT_
             with _tool("get_depot_state", {"date": night.isoformat()}) as sp:
                 dep = make_depot(night)
                 constraints = _constraints(dep)
+            with _tool("recall", {"q": "what changed since last night?"}) as sp:
+                changed = memory.changes_since(24)[:6]
+                _set_output(sp, changed)
                 cap = float(cap_kw or dep.site_cap_kw)
                 _set_output(sp, {"buses": len(dep.buses), "energy_needed_kwh": round(dep.energy_needed_kwh()),
                                  "constraints": len(constraints)})
@@ -281,6 +370,10 @@ def run_plan(d=None, cap_kw: float | None = None, prompt_version: str = DEFAULT_
                      "ok": not sim_opt["violations"], "detail": sim_opt.get("sandbox_id") or "local subprocess",
                      "sandbox_id": sim_opt.get("sandbox_id")},
                 ]
+                if anchor_t is not None:
+                    anchor_t.join(timeout=12)
+                    if anchor_box.get("row"):
+                        checks.append(anchor_box["row"])
                 _set_output(sp, checks)
 
             yield {"kind": "status", "text": "drafting dispatcher message"}
@@ -290,11 +383,13 @@ def run_plan(d=None, cap_kw: float | None = None, prompt_version: str = DEFAULT_
                      "priciest_hour": max(hourly, key=lambda h: h["usd_mwh"]),
                      "baseline": {k: sim_base[k] for k in ("cost_usd", "peak_kw", "kwh", "avg_usd_mwh")},
                      "optimal": {k: sim_opt[k] for k in ("cost_usd", "peak_kw", "kwh", "avg_usd_mwh", "min_soc_at_departure", "violations")},
-                     "savings": sav, "simulated_in": sim_opt["where"], "constraints": [c["value"] for c in constraints]}
+                     "savings": sav, "simulated_in": sim_opt["where"], "constraints": [c["value"] for c in constraints],
+                     "memory_changes_since_last_night": [c for c in changed if not c.startswith("price_forecast")][:4]}
             text = draft(facts, prompt_version)
 
             evals = arize.eval_plan(text["message"] + " " + text["explanation"], sim_opt,
-                                    {**sav, "baseline_cost_usd": sim_base["cost_usd"], "optimal_cost_usd": sim_opt["cost_usd"]})
+                                    {**sav, "baseline_cost_usd": sim_base["cost_usd"], "optimal_cost_usd": sim_opt["cost_usd"]},
+                                    prices_usd_mwh=[h["usd_mwh"] for h in hourly] + [sim_base["avg_usd_mwh"]])
             arize.annotate(root, evals)
 
             plan = {
@@ -352,3 +447,62 @@ def approve(plan_id: str, approved: bool, who: str = "dispatcher") -> dict:
                                                       "tonight_usd": plan["savings"]["tonight_usd"],
                                                       "monthly_usd": plan["savings"]["monthly_usd"]}, f"human:{who}")
     return {"plan_id": plan_id, "status": status, "fact_id": fact["id"], "date": plan["date"]}
+
+
+_TIME = re.compile(r"(\d{1,2})(?::(\d{2}))?\s*(am|pm|a\.m\.|p\.m\.)?", re.I)
+
+
+def parse_constraint(text: str) -> dict | None:
+    """'bus 12 leaves at 04:00' / 'bus 7 departs 4:30am' / 'bus 3 arrives at 9pm' -> {bus_id, departure_hour|arrival_hour}.
+    Hours are measured from midnight of the night's start date (05:00 next morning = 29)."""
+    m = re.search(r"bus\s*#?\s*(\d+)", text or "", re.I)
+    if not m:
+        return None
+    rest = text[m.end():]
+    t = _TIME.search(rest)
+    if not t:
+        return None
+    h = int(t.group(1)) + int(t.group(2) or 0) / 60
+    ap = (t.group(3) or "").lower().replace(".", "")
+    if ap == "pm" and h < 12:
+        h += 12
+    if ap == "am" and h >= 12:
+        h -= 12
+    if h < 12:  # early morning belongs to the next day
+        h += 24
+    arrive = bool(re.search(r"arriv|pull(s)?\s*in|gets? in|back", rest, re.I))
+    return {"bus_id": int(m.group(1)), ("arrival_hour" if arrive else "departure_hour"): round(h, 3)}
+
+
+def summary(plan: dict) -> dict:
+    """Compact plan for voice tools."""
+    s = plan["savings"]
+    return {"plan_id": plan["plan_id"], "night": plan["date"], "tonight_usd": round(s["tonight_usd"]),
+            "monthly_usd": round(s["monthly_usd"]), "pct": s["pct"], "charging_window": plan["charging_window"],
+            "peak_kw": round(plan["optimal"]["peak_kw"]), "cap_kw": plan["cap_kw"],
+            "violations": len(plan["optimal"]["violations"]), "min_departure_soc": plan["optimal"]["min_soc_at_departure"],
+            "simulated_in": plan["simulated_in"], "sandbox_id": plan["sandbox_id"], "constraints": plan["constraints"],
+            "message": plan["message"], "status": plan["status"]}
+
+
+def latest_plan() -> dict | None:
+    return list(PLANS.values())[-1] if PLANS else None
+
+
+def replan(constraint: str | None = None, cap_kw: float | None = None, d=None) -> dict:
+    stored = None
+    if constraint:
+        c = parse_constraint(constraint)
+        if not c:
+            return {"error": f"could not parse constraint {constraint!r}; say e.g. 'bus 12 leaves at 04:00'"}
+        stored = add_constraint(c["bus_id"], c.get("departure_hour"), c.get("arrival_hour"), source="voice")
+    plan = None
+    for ev in run_plan(d, cap_kw):
+        if ev["kind"] == "plan":
+            plan = ev
+        elif ev["kind"] == "error":
+            return {"error": ev["text"]}
+    out = summary(plan) if plan else {"error": "no plan"}
+    if stored:
+        out["stored_constraint"] = {"id": stored["id"], "value": stored["value"]}
+    return out

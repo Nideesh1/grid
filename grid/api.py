@@ -25,6 +25,7 @@ _backtest_cache: dict = {}
 async def lifespan(app: FastAPI):
     # warm the Daytona sandbox in the background so the first plan does not pay for creation
     threading.Thread(target=daytona_sim.sandbox_id, daemon=True).start()
+    threading.Thread(target=voice.ensure_agent, daemon=True).start()
     yield
     daytona_sim.shutdown()
 
@@ -48,6 +49,12 @@ class ApproveReq(BaseModel):
     who: str | None = "dispatcher"
 
 
+class ReplanReq(BaseModel):
+    constraint: str | None = None
+    cap_kw: float | None = None
+    date: str | None = None
+
+
 class ConstraintReq(BaseModel):
     bus_id: int
     departure_hour: float | None = None
@@ -64,11 +71,11 @@ def health():
             "daytona": daytona_sim.status(),
             "memory": memory.status(),
             "arize": arize.status(),
-            "elevenlabs": voice.status(),
+            "elevenlabs": {**voice.status(), **voice.agent_status()},
             "anchor": anchor.status(),
             "agentglow": {"enabled": tr["agentglow"], "url": AGENTGLOW_URL, "scene": f"{AGENTGLOW_URL}/backend"},
         },
-        "keys": {k: has(k) for k in ("DAYTONA_API_KEY", "MISTRAL_API_KEY", "ANTHROPIC_API_KEY", "ARIZE_API_KEY",
+        "keys": {k: has(k) for k in ("DAYTONA_API_KEY", "AWS_ACCESS_KEY_ID", "MISTRAL_API_KEY", "ANTHROPIC_API_KEY", "ARIZE_API_KEY",
                                      "ELEVENLABS_API_KEY", "SURREAL_URL", "ANCHOR_API_KEY", "DISPATCH_PHONE")},
     }
 
@@ -114,6 +121,30 @@ async def post_plan(req: PlanReq | None = None):
                              headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
+@app.get("/api/plan/latest")
+def get_latest_plan():
+    p = agent.latest_plan()
+    if not p:  # voice agent asked before the UI planned: make one
+        return agent.replan()
+    return agent.summary(p)
+
+
+@app.post("/api/replan")
+def post_replan(req: ReplanReq):
+    """Voice tool: store a constraint (supersedes earlier ones for that bus) and re-plan. Returns a compact summary."""
+    return agent.replan(req.constraint, req.cap_kw, req.date)
+
+
+@app.get("/api/voice/agent")
+def get_voice_agent(signed: bool = False):
+    if not voice.enabled():
+        raise HTTPException(503, "ElevenLabs disabled (no ELEVENLABS_API_KEY)")
+    aid = voice.ensure_agent()
+    if not aid:
+        raise HTTPException(502, voice.agent_status()["agent_error"] or "agent setup failed")
+    return {"agent_id": aid, "signed_url": voice.signed_url(aid) if signed else None}
+
+
 @app.get("/api/plan/{plan_id}")
 def get_plan(plan_id: str):
     p = agent.PLANS.get(plan_id)
@@ -156,5 +187,13 @@ def post_constraint(req: ConstraintReq):
 
 
 @app.get("/api/memory")
-def get_memory(kind: str = "plan", key: str | None = None, history: bool = True):
-    return {"backend": memory.backend(), "facts": memory.recall(kind, key, history)}
+def get_memory(kind: str | None = None, key: str | None = None, history: bool = True, limit: int = 20):
+    """Memory panel: status, last facts (newest first, superseded ones carry valid_until + superseded_by),
+    and the supersession diff of the last 24h."""
+    facts = memory.recall(kind, key, history) if kind else memory.recent(limit)
+    return {"status": memory.status(), "facts": facts, "changes_24h": memory.changes_since(24)}
+
+
+@app.get("/api/memory/ask")
+def get_memory_ask(q: str = "what changed since last night?"):
+    return memory.ask(q)
