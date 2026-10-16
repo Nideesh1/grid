@@ -1,0 +1,11 @@
+# grid UI: Vite build, served with `vite preview` on :5520. VITE_API is baked in at build time.
+FROM node:22-slim
+WORKDIR /ui
+COPY ui/package.json ui/package-lock.json ./
+RUN npm ci --no-audit --no-fund
+COPY ui/ ./
+ARG VITE_API=http://localhost:8520
+ENV VITE_API=$VITE_API
+RUN npx vite build
+EXPOSE 5520
+CMD ["npx", "vite", "preview", "--host", "0.0.0.0", "--port", "5520", "--strictPort"]

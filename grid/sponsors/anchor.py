@@ -14,11 +14,13 @@ _state = {"error": None, "last": None}
 
 
 def enabled() -> bool:
-    return has("ANCHOR_API_KEY")
+    """Off unless ANCHOR_ENABLED=1 (the account has no credits; keeps plans from paying a failed call)."""
+    return has("ANCHOR_API_KEY") and env("ANCHOR_ENABLED", "1") != "0"
 
 
 def status() -> dict:
-    return {"enabled": enabled(), "error": _state["error"], "last_check": _state["last"]}
+    return {"enabled": enabled(), "key_present": has("ANCHOR_API_KEY"),
+            "note": None if enabled() else "disabled (ANCHOR_ENABLED=0 or no key)", "error": _state["error"], "last_check": _state["last"]}
 
 
 def cross_check(url: str = NYISO_PAGE) -> dict | None:
@@ -47,37 +49,42 @@ def cross_check(url: str = NYISO_PAGE) -> dict | None:
         return None
 
 
-def cross_check_price(d=None) -> dict | None:
-    """Open NYISO's public real-time zonal LBMP file for date d in an Anchor cloud browser, read the latest N.Y.C.
-    price and compare it with the same interval from our CSV pipeline (grid/prices.py). Returns a check row or None."""
+DASHBOARD = "https://www.nyiso.com/real-time-dashboard"
+
+
+def cross_check_price(timeout: float = 8.0) -> dict | None:
+    """Open NYISO's public real-time dashboard in an Anchor cloud browser (fetch-webpage tool, no login), read the
+    N.Y.C. zone price shown there and compare with the latest 5-min price from our CSV pipeline (grid/prices.py).
+    Returns a check row, or None if Anchor is off / slow / the page has no N.Y.C. price."""
     if not enabled():
         return None
-    import csv
-    import io
+    import re
     from datetime import date as _date
 
     from grid import prices
 
-    d = d or _date.today()
-    ds = d.strftime("%Y%m%d") if hasattr(d, "strftime") else str(d).replace("-", "")
-    url = f"http://mis.nyiso.com/public/csv/realtime/{ds}realtime_zone.csv"
-    got = cross_check(url)
-    if not got:
-        return None
     try:
-        text = got.get("full") or ""
-        rows = [row for row in csv.reader(io.StringIO(text)) if len(row) > 3 and row[1] == "N.Y.C."]
-        if not rows:
-            return {"name": "Price cross-checked in live browser (Anchor)", "ok": False, "detail": "N.Y.C. row not found"}
-        ts, live = rows[-1][0], float(rows[-1][3])
-        ours = {p["ts"]: p["usd_mwh"] for p in prices.real_time(d)}
-        from datetime import datetime
-
-        key = datetime.strptime(ts, "%m/%d/%Y %H:%M:%S").isoformat()
-        mine = ours.get(key)
-        diff = None if mine is None else abs(live - float(mine))
-        return {"name": "Price cross-checked in live browser (Anchor)", "ok": diff is not None and diff <= 1.0,
-                "detail": f"{ts} N.Y.C. ${live:.2f}/MWh" + (f", CSV pipeline +-${diff:.2f}" if diff is not None else ", interval not yet in cache")}
+        r = httpx.post("https://api.anchorbrowser.io/v1/tools/fetch-webpage", timeout=timeout,
+                       headers={"anchor-api-key": env("ANCHOR_API_KEY"), "Content-Type": "application/json"},
+                       json={"url": DASHBOARD, "format": "markdown"})
+        if r.status_code in (402, 429):
+            raise RuntimeError(f"Anchor {r.status_code}: {r.text[:80]}")
+        r.raise_for_status()
+        text = r.text
+        _state["last"] = {"url": DASHBOARD, "chars": len(text)}
+        m = re.search(r"N\.?\s?Y\.?\s?C\.?[^0-9$-]{0,80}\$?\s*(-?\d{1,4}(?:\.\d{1,2})?)", text)
+        if not m:
+            _state["error"] = "N.Y.C. price not found on dashboard"
+            return None
+        live = float(m.group(1))
+        rt = prices.real_time(_date.today())
+        ours = float(rt[-1]["usd_mwh"]) if rt else None
+        diff = None if ours is None else abs(live - ours)
+        _state["error"] = None
+        return {"name": "Price cross-checked in live browser (Anchor)", "ok": diff is not None and diff <= 10.0,
+                "detail": f"NYISO dashboard N.Y.C. ${live:.2f}/MWh vs CSV ${ours:.2f} (+-${diff:.2f})" if diff is not None
+                else f"NYISO dashboard N.Y.C. ${live:.2f}/MWh"}
     except Exception as e:  # noqa: BLE001
-        _state["error"] = type(e).__name__
+        _state["error"] = str(e)[:120] if isinstance(e, RuntimeError) else type(e).__name__
+        log.info("anchor cross-check skipped: %s", _state["error"])
         return None

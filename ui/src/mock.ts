@@ -1,80 +1,93 @@
-// Realistic mock data shaped like the CONTRACTS.md API. Used with ?mock=1.
-// Prices: typical October NYISO N.Y.C. day-ahead shape (evening peak, overnight trough).
+// Realistic mock data shaped like the CONTRACTS.md PIVOT API (battery arbitrage). Used with ?mock=1.
+// Prices: typical October NYISO N.Y.C. day-ahead shape (morning bump, evening peak, overnight trough).
 
-const DATE = "2026-10-16";
-const NEXT = "2026-10-17";
+const DATE = "2026-10-17";
 const DA: number[] = [
-  // 00..23 $/MWh
   27.1, 24.8, 22.6, 21.9, 22.4, 25.3, 31.8, 42.5, 48.9, 46.2, 43.7, 41.9,
   40.8, 41.5, 44.0, 49.6, 58.3, 74.9, 88.4, 92.7, 81.2, 63.5, 47.8, 35.6,
 ];
 
-export const mockPrices = [
-  ...DA.slice(12).map((p, i) => ({ ts: `${DATE}T${String(i + 12).padStart(2, "0")}:00:00`, usd_mwh: p })),
-  ...DA.slice(0, 12).map((p, i) => ({ ts: `${NEXT}T${String(i).padStart(2, "0")}:00:00`, usd_mwh: p })),
-];
+// 10 MW / 40 MWh, eta = sqrt(0.85) each way, SOC 10..90%, start/end 50%.
+const ETA = Math.sqrt(0.85);
+const CAP = 40;
+function build(charge: Record<number, number>, discharge: Record<number, number>) {
+  let e = CAP * 0.5;
+  let revenue = 0;
+  let cost = 0;
+  let out = 0;
+  const schedule = DA.map((price, hour) => {
+    const c = charge[hour] ?? 0;
+    const d = discharge[hour] ?? 0;
+    e += c * ETA - d / ETA;
+    revenue += d * price;
+    cost += c * price;
+    out += d;
+    return { hour, price, charge_mw: c, discharge_mw: d, soc_pct: +((e / CAP) * 100).toFixed(1) };
+  });
+  const profit = revenue - cost - 8 * out;
+  return { schedule, revenue_usd: +revenue.toFixed(2), cost_usd: +cost.toFixed(2), profit_usd: +profit.toFixed(2) };
+}
 
-// Baseline: 40 buses x 150 kW plug in at 19:00, uncapped, until full.
-const baselineSchedule = [
-  { hour: 19, kw: 6000 },
-  { hour: 20, kw: 5640 },
-  { hour: 21, kw: 2160 },
-];
-// Optimal: >= 90% by 05:00, <= 3,000 kW, in the overnight trough.
-const optimalSchedule = [
-  { hour: 22, kw: 0 },
-  { hour: 23, kw: 420 },
-  { hour: 0, kw: 1680 },
-  { hour: 1, kw: 2760 },
-  { hour: 2, kw: 2940 },
-  { hour: 3, kw: 2940 },
-  { hour: 4, kw: 1820 },
-];
+// Optimal: fill to 90% in the 2-3am trough, sell into the 5-8pm peak down to 10%, refill to 50% late evening.
+const optimal = build({ 2: 10, 3: 7.35, 22: 7.35, 23: 10 }, { 17: 9.5, 18: 10, 19: 10 });
+// Naive rule: buy 01:00-05:00, sell 17:00-21:00, same energy back out.
+const baseline = build({ 1: 4, 2: 4, 3: 4, 4: 4 }, { 17: 3.4, 18: 3.4, 19: 3.4, 20: 3.4 });
 
-export const mockPlanEvents = [
-  { kind: "status", text: "Fetching NYISO day-ahead prices for zone N.Y.C. (2026-10-17)" },
-  { kind: "status", text: "Recalling depot constraints from SurrealDB memory: bus 12 departs 04:00" },
-  { kind: "status", text: "Depot state: 40 buses, arriving 19:00 at 21% to 39% SOC" },
-  { kind: "status", text: "Building baseline: plug in at 7pm, full power" },
-  { kind: "status", text: "Solving LP (HiGHS): 40 buses x 10 hours, site cap 3,000 kW" },
-  { kind: "status", text: "Simulating plan in Daytona sandbox sbx-7f3c2a91" },
-  { kind: "status", text: "Simulation passed: 0 violations, min SOC 90.4%, peak 2,940 kW" },
-  { kind: "status", text: "Pricing savings against real NYISO LBMP" },
-  {
-    kind: "plan",
-    plan_id: "plan-2026-10-16-n1",
-    baseline: { schedule: baselineSchedule, cost_usd: 1648.22, peak_kw: 6000 },
-    optimal: { schedule: optimalSchedule, cost_usd: 834.77, peak_kw: 2940, min_soc_at_departure: 0.904, violations: [] },
-    schedule: optimalSchedule,
-    savings: { tonight_usd: 813.45, monthly_usd: 114403.5, pct: 49.4 },
-    checks: { min_soc: 0.904, peak_kw: 2940, cap_kw: 3000, violations: 0, sandbox_id: "sbx-7f3c2a91" },
-    voice_text: "Tonight's plan: hold charging until 11pm, then charge through 4am under the 3,000 kilowatt cap. Every bus leaves at 90 percent or better. Saves 813 dollars versus plugging in at 7. Approve?",
-  },
-  { kind: "done" },
-];
+const socs = optimal.schedule.map((r) => r.soc_pct);
+const discharged = optimal.schedule.reduce((a, r) => a + r.discharge_mw, 0);
 
 function seeded(i: number): number {
   const x = Math.sin(i * 9301 + 49297) * 233280;
   return x - Math.floor(x);
 }
-
 const days = Array.from({ length: 30 }, (_, i) => {
   const d = new Date(Date.UTC(2026, 8, 16 + i));
-  const base = 1350 + seeded(i) * 700 + (d.getUTCDay() % 6 === 0 ? -120 : 0);
-  const saved = base * (0.36 + seeded(i + 50) * 0.2);
-  return {
-    date: d.toISOString().slice(0, 10),
-    baseline_usd: +base.toFixed(2),
-    optimal_usd: +(base - saved).toFixed(2),
-    saved_usd: +saved.toFixed(2),
-  };
+  const opt = 700 + seeded(i) * 1100 + (seeded(i + 7) > 0.85 ? 1800 : 0);
+  const base = opt * (0.35 + seeded(i + 50) * 0.35) - (seeded(i + 3) > 0.8 ? 400 : 0);
+  return { date: d.toISOString().slice(0, 10), baseline_profit: +base.toFixed(2), optimal_profit: +opt.toFixed(2) };
 });
 
 export const mockBacktest = {
   days,
   totals: {
-    baseline_usd: +days.reduce((a, d) => a + d.baseline_usd, 0).toFixed(2),
-    optimal_usd: +days.reduce((a, d) => a + d.optimal_usd, 0).toFixed(2),
-    saved_usd: +days.reduce((a, d) => a + d.saved_usd, 0).toFixed(2),
+    baseline_profit: +days.reduce((a, d) => a + d.baseline_profit, 0).toFixed(2),
+    optimal_profit: +days.reduce((a, d) => a + d.optimal_profit, 0).toFixed(2),
   },
+};
+
+const SBX = "sbx-7f3c2a91";
+export const mockPlanEvents: Record<string, unknown>[] = [
+  { kind: "status", text: `Fetching NYISO day-ahead prices for zone N.Y.C. (${DATE})` },
+  { kind: "status", text: "Recalling operator constraints from SurrealDB memory: keep 10% reserve" },
+  { kind: "status", text: "Battery: 10 MW / 40 MWh, 85% round trip, starts 50% full" },
+  { kind: "status", text: "Solving LP (HiGHS): 24 hours, 1 cycle limit, $8/MWh degradation" },
+  { kind: "status", text: `Simulating plan in Daytona sandbox ${SBX}` },
+  ...[5, 10, 15, 20, 25, 30].map((n) => ({ kind: "backtest", n, of: 30, sandbox_id: SBX, text: `Simulating night ${n}/30 in sandbox ${SBX}` })),
+  { kind: "status", text: "Simulation passed: 0 violations, 1.00 cycle, ends 50% full" },
+  {
+    kind: "plan",
+    plan_id: "arb-2026-10-17-a1",
+    date: DATE,
+    schedule: optimal.schedule,
+    profit_usd: optimal.profit_usd,
+    revenue_usd: optimal.revenue_usd,
+    cost_usd: optimal.cost_usd,
+    baseline_profit_usd: baseline.profit_usd,
+    backtest_total_usd: mockBacktest.totals.optimal_profit,
+    optimal: { min_soc: Math.min(...socs) / 100, max_soc: Math.max(...socs) / 100, end_soc: socs[23] / 100, cycles: +(discharged / ETA / (CAP * 0.8)).toFixed(2), violations: [] },
+    sandbox_id: SBX,
+    simulated_in: "daytona",
+    voice_text: `Tomorrow: buy at 2 and 3am, sell from 5 to 8pm, refill late evening. Profit about ${Math.round(optimal.profit_usd)} dollars, one cycle, ends half full. Approve?`,
+  },
+  { kind: "done" },
+];
+
+export const mockMemory = {
+  backend: "surrealdb",
+  facts: [
+    { id: "f3", kind: "constraint", key: "reserve", value: { reserve_pct: 30, reason: "storm watch" }, source: "voice:operator", valid_from: "2026-10-16T17:02:10+00:00", valid_until: null, superseded_by: null },
+    { id: "f2", kind: "constraint", key: "reserve", value: { reserve_pct: 10 }, source: "battery:default", valid_from: "2026-10-15T23:00:00+00:00", valid_until: "2026-10-16T17:02:10+00:00", superseded_by: "f3" },
+    { id: "f5", kind: "price_forecast", key: "2026-10-17 19:00", value: { usd_mwh: 92.7 }, source: "nyiso:dam", valid_from: "2026-10-16T15:30:00+00:00", valid_until: null, superseded_by: null },
+    { id: "f4", kind: "price_forecast", key: "2026-10-17 19:00", value: { usd_mwh: 84.1 }, source: "nyiso:dam", valid_from: "2026-10-15T15:30:00+00:00", valid_until: "2026-10-16T15:30:00+00:00", superseded_by: "f5" },
+  ],
 };

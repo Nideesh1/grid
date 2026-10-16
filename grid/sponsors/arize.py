@@ -80,7 +80,8 @@ def eval_plan(message: str, sim: dict, savings: dict, tol: float = 1.0, prices_u
     matches a number the tools produced (within tol, or rounding to the nearest $10/$100 for spoken figures)."""
     viol = sim.get("violations") or []
     allowed = [float(x) for x in (savings.get("tonight_usd"), savings.get("monthly_usd"), sim.get("cost_usd"),
-                                  savings.get("baseline_cost_usd"), savings.get("optimal_cost_usd")) if isinstance(x, (int, float))]
+                                  savings.get("baseline_cost_usd"), savings.get("optimal_cost_usd"),
+                                  *(savings.get("extra") or [])) if isinstance(x, (int, float))]
     figs = dollar_figures(message)
 
     def ok(f: float) -> bool:

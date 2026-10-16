@@ -9,10 +9,13 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@elevenlabs/react": "^1.18.0",
+    "@openuidev/react-lang": "^0.3.2",
     "agentglow": "^0.4.9",
     "react": "^19.1.0",
     "react-dom": "^19.1.0",
-    "recharts": "^2.15.4"
+    "recharts": "^2.15.4",
+    "zod": "^4.6.7"
   },
   "devDependencies": {
     "@types/react": "^19.1.0",

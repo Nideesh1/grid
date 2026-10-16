@@ -38,7 +38,8 @@ setup_tracing(app)
 
 class PlanReq(BaseModel):
     date: str | None = None
-    cap_kw: float | None = None
+    note: str | None = None
+    fast: bool = False
     prompt_version: str | None = None
     speak: bool = True
 
@@ -51,14 +52,11 @@ class ApproveReq(BaseModel):
 
 class ReplanReq(BaseModel):
     constraint: str | None = None
-    cap_kw: float | None = None
     date: str | None = None
 
 
 class ConstraintReq(BaseModel):
-    bus_id: int
-    departure_hour: float | None = None
-    arrival_hour: float | None = None
+    text: str
 
 
 @app.get("/api/health")
@@ -82,39 +80,27 @@ def health():
 
 @app.get("/api/prices")
 def get_prices(date: str | None = None):
-    d = date or __import__("datetime").date.today().isoformat()
-    da = prices.night(d, "da")
-    rt = prices.night(d, "rt")
-    if not rt:  # tonight has not happened yet: show last night's real-time for context
-        prev = (__import__("datetime").date.fromisoformat(d) - timedelta(days=1)).isoformat()
-        rt_prev = prices.night(prev, "rt")
-    else:
-        rt_prev = []
-    return {"date": d, "zone": "N.Y.C.", "source": "NYISO public LBMP CSV (mis.nyiso.com)",
-            "day_ahead": da, "real_time": rt, "real_time_last_night": rt_prev,
-            "proxy": any(r.get("proxy") for r in da)}
+    """Hourly NYISO N.Y.C. day-ahead for the trading day (default tomorrow, else today) + today's real-time so far."""
+    import datetime as _dt
+
+    d = _dt.date.fromisoformat(date) if date else _dt.date.today() + timedelta(days=1)
+    da = prices.day_ahead(d)
+    if len(da) < 20 and not date:
+        d = _dt.date.today()
+        da = prices.day_ahead(d)
+    return {"date": d.isoformat(), "zone": "N.Y.C.", "source": "NYISO public LBMP CSV (mis.nyiso.com)",
+            "day_ahead": optimize.hourly_prices(da) if da else [],
+            "real_time_today": optimize.hourly_prices(prices.real_time(_dt.date.today()) or [])}
 
 
 @app.post("/api/plan")
-async def post_plan(req: PlanReq | None = None):
+async def post_plan(req: PlanReq | None = None, fast: bool = False):
+    """SSE. Default: the deepagents trading desk (market-analyst, trader, risk-officer) with live status lines, then a
+    plan event. ?fast=1 (or desk error / >45s): the direct optimizer path."""
     req = req or PlanReq()
-    q: asyncio.Queue = asyncio.Queue()
-    loop = asyncio.get_running_loop()
-
-    def work():
-        try:
-            for ev in agent.run_plan(req.date, req.cap_kw, req.prompt_version or agent.DEFAULT_PROMPT, req.speak):
-                loop.call_soon_threadsafe(q.put_nowait, ev)
-        finally:
-            loop.call_soon_threadsafe(q.put_nowait, None)
-
-    loop.run_in_executor(None, work)
 
     async def stream():
-        while True:
-            ev = await q.get()
-            if ev is None:
-                break
+        async for ev in agent.desk_or_fast(req.date, req.note, fast=fast or req.fast, speak=req.speak):
             yield f"data: {json.dumps(ev, default=str)}\n\n"
 
     return StreamingResponse(stream(), media_type="text/event-stream",
@@ -130,9 +116,24 @@ def get_latest_plan():
 
 
 @app.post("/api/replan")
-def post_replan(req: ReplanReq):
-    """Voice tool: store a constraint (supersedes earlier ones for that bus) and re-plan. Returns a compact summary."""
-    return agent.replan(req.constraint, req.cap_kw, req.date)
+async def post_replan(req: ReplanReq, fast: bool = False):
+    """Voice tool: re-plan with an operator note (the desk reads it; the fast path parses and stores it as constraints
+    with supersession). Returns a compact JSON summary."""
+    if req.constraint:
+        c = agent.parse_constraint(req.constraint)
+        for k, v in (c or {}).items():  # remember it either way so later plans keep it
+            agent.add_constraint(k, v, req.constraint, "voice")
+    plan, statuses = None, []
+    async for ev in agent.desk_or_fast(req.date, req.constraint, fast=fast, speak=False):
+        if ev["kind"] == "plan":
+            plan = ev
+        elif ev["kind"] == "status":
+            statuses.append(ev["text"])
+        elif ev["kind"] == "error":
+            return {"error": ev["text"]}
+    if not plan:
+        return {"error": "no plan", "status": statuses[-3:]}
+    return {**agent.summary(plan), "verdict": plan.get("verdict"), "engine": plan.get("engine", "fast")}
 
 
 @app.get("/api/voice/agent")
@@ -154,11 +155,58 @@ def get_plan(plan_id: str):
 
 
 @app.get("/api/backtest")
-def get_backtest(days: int = 30, mode: str = "rt"):
-    key = (days, mode, date.today().isoformat())
+def get_backtest(days: int = 30, sandbox: bool = False):
+    """Plan on day-ahead, settle on real-time, last `days` days. sandbox=1: fan out one Daytona sandbox per day.
+    Cached per (days, mode, today)."""
+    key = (days, sandbox, date.today().isoformat())
     if key not in _backtest_cache:
-        _backtest_cache[key] = optimize.backtest(days=days, mode=mode)
+        if sandbox:
+            _backtest_cache[key] = agent.backtest_fanout(days)
+        else:
+            r = optimize.arb_backtest(days=days)
+            for x in r["days"]:
+                x.update(baseline_usd=x["baseline_profit"], optimal_usd=x["optimal_profit"], saved_usd=x["optimal_profit"])
+            t = r["totals"]
+            t.update(saved_usd=t["optimal_profit"], baseline_usd=t["baseline_profit"], sandboxes=0)
+            _backtest_cache[key] = r
     return _backtest_cache[key]
+
+
+@app.get("/api/backtest/stream")
+async def get_backtest_stream(days: int = 30):
+    """SSE: {"kind":"status","text":"night 12/30 simulated in sandbox <id>", i, n, date, sandbox_id} ... then
+    {"kind":"backtest", days, totals} and {"kind":"done"}. One ephemeral Daytona sandbox per day, 8 at a time."""
+    q: asyncio.Queue = asyncio.Queue()
+    loop = asyncio.get_running_loop()
+
+    def progress(i, n, label, sid, where):
+        text = f"night {i}/{n} simulated in sandbox {sid}" if sid else f"night {i}/{n} simulated locally"
+        loop.call_soon_threadsafe(q.put_nowait, {"kind": "status", "text": text, "i": i, "n": n,
+                                                 "date": label.removeprefix("day "), "sandbox_id": sid, "where": where})
+
+    def work():
+        try:
+            loop.call_soon_threadsafe(q.put_nowait, {"kind": "status", "text": f"fanning out {days} days across Daytona sandboxes (8 at a time)"})
+            r = agent.backtest_fanout(days, on_progress=progress)
+            _backtest_cache[(days, True, date.today().isoformat())] = r
+            loop.call_soon_threadsafe(q.put_nowait, {"kind": "backtest", **r})
+        except Exception as e:  # noqa: BLE001
+            loop.call_soon_threadsafe(q.put_nowait, {"kind": "error", "text": f"{type(e).__name__}: {str(e)[:200]}"})
+        finally:
+            loop.call_soon_threadsafe(q.put_nowait, {"kind": "done"})
+            loop.call_soon_threadsafe(q.put_nowait, None)
+
+    loop.run_in_executor(None, work)
+
+    async def stream():
+        while True:
+            ev = await q.get()
+            if ev is None:
+                break
+            yield f"data: {json.dumps(ev, default=str)}\n\n"
+
+    return StreamingResponse(stream(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
 @app.post("/api/approve")
@@ -181,9 +229,18 @@ def get_voice(plan_id: str):
     return FileResponse(p, media_type="audio/mpeg")
 
 
+@app.get("/api/constraints")
+def get_constraints():
+    return {"active": agent.active_constraints(), "defaults": agent.DEFAULT_CONSTRAINTS}
+
+
 @app.post("/api/constraints")
 def post_constraint(req: ConstraintReq):
-    return agent.add_constraint(req.bus_id, req.departure_hour, req.arrival_hour)
+    """Store a constraint without re-planning (supersedes the previous value of each key)."""
+    c = agent.parse_constraint(req.text)
+    if not c:
+        raise HTTPException(422, "could not parse constraint")
+    return {"stored": [agent.add_constraint(k, v, req.text, "ui") for k, v in c.items()], "active": agent.active_constraints()}
 
 
 @app.get("/api/memory")
@@ -197,3 +254,16 @@ def get_memory(kind: str | None = None, key: str | None = None, history: bool = 
 @app.get("/api/memory/ask")
 def get_memory_ask(q: str = "what changed since last night?"):
     return memory.ask(q)
+
+
+# ---- extra routers (other tracks mount here, e.g. grid/ask.py: `router = APIRouter()`)
+for _mod in ("grid.ask", "grid.runs"):
+    try:
+        import importlib
+
+        app.include_router(importlib.import_module(_mod).router)
+        log.info("mounted router %s", _mod)
+    except ModuleNotFoundError:
+        pass
+    except Exception as e:  # noqa: BLE001
+        log.warning("router %s not mounted: %s", _mod, e)

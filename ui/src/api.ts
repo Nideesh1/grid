@@ -1,117 +1,148 @@
 // API client + normalizers. Shapes follow CONTRACTS.md; every field is read defensively so
 // small backend differences do not blank the page.
-import { mockBacktest, mockPlanEvents, mockPrices } from "./mock";
+import { mockBacktest, mockMemory, mockPlanEvents } from "./mock";
 
 export const API: string = (import.meta.env.VITE_API as string | undefined) ?? "http://localhost:8520";
 export const MOCK = new URLSearchParams(window.location.search).get("mock") === "1";
 
 export type PricePoint = { ts: string; usd_mwh: number };
-export type HourLoad = { hour: number; kw: number };
 export type Check = { name: string; ok: boolean; detail?: string };
+export type Row = { hour: number; price: number | null; charge_mw: number; discharge_mw: number; soc_pct: number | null };
 
 export type Plan = {
   plan_id?: string;
-  baseline: HourLoad[];
-  optimal: HourLoad[];
-  prices: PricePoint[];
-  tonight_usd: number;
-  monthly_usd: number;
-  pct?: number;
-  baseline_cost?: number;
-  optimal_cost?: number;
+  date?: string;
+  rows: Row[];
+  profit_usd: number;
+  baseline_profit_usd?: number;
+  revenue_usd?: number;
+  cost_usd?: number;
+  backtest_total_usd?: number;
+  cycles?: number;
   min_soc?: number;
-  peak_kw?: number;
-  baseline_peak_kw?: number;
-  cap_kw: number;
+  max_soc?: number;
+  end_soc?: number;
+  reserve_pct?: number;
   violations: number;
+  status?: string;
   sandbox?: string; // Daytona sandbox id, or undefined = local
   checks: Check[];
   audio_url?: string;
   voice_text?: string;
 };
 
-export type BacktestDay = { date: string; baseline_usd: number; optimal_usd: number; saved_usd: number };
-export type Backtest = { days: BacktestDay[]; total_saved: number; total_baseline?: number };
+export type BacktestDay = { date: string; baseline: number; optimal: number };
+export type Backtest = { days: BacktestDay[]; total: number; total_baseline: number };
+export type Progress = { n: number; of: number; sandbox?: string; text?: string };
 
-export type StreamEvent =
-  | { kind: "status"; text: string }
-  | { kind: "plan"; [k: string]: unknown }
-  | { kind: "done" }
-  | { kind: "error"; text?: string };
+export type StreamEvent = { kind: string; [k: string]: any };
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 const num = (v: any): number | undefined => (typeof v === "number" && isFinite(v) ? v : typeof v === "string" && v !== "" && isFinite(+v) ? +v : undefined);
 
-function hourOf(x: any): number {
-  if (typeof x === "number") return ((x % 24) + 24) % 24;
+/** First numeric value found at any of the dotted paths. */
+function pick(o: any, paths: string[]): number | undefined {
+  for (const p of paths) {
+    const v = p.split(".").reduce((a: any, k) => (a == null ? undefined : a[k]), o);
+    const n = num(v);
+    if (n !== undefined) return n;
+  }
+  return undefined;
+}
+function pickStr(o: any, paths: string[]): string | undefined {
+  for (const p of paths) {
+    const v = p.split(".").reduce((a: any, k) => (a == null ? undefined : a[k]), o);
+    if (typeof v === "string" && v) return v;
+  }
+  return undefined;
+}
+
+export function hourOf(x: any): number {
+  if (typeof x === "number") return ((Math.floor(x) % 24) + 24) % 24;
   const s = String(x);
-  const m = s.match(/[T ](\d{2}):/);
+  const m = s.match(/[T ](\d{2}):/) ?? s.match(/^(\d{1,2}):\d{2}/);
   if (m) return +m[1];
   if (/^\d{1,2}$/.test(s)) return +s;
   return new Date(s).getHours();
 }
 
-function loads(v: any): HourLoad[] {
-  if (!v) return [];
-  const arr = Array.isArray(v) ? v : v.schedule ?? v.load ?? v.hourly ?? v.kw ?? [];
-  if (!Array.isArray(arr)) return [];
-  return arr.map((p: any, i: number) =>
-    typeof p === "number" ? { hour: i, kw: p } : { hour: hourOf(p.hour ?? p.ts ?? p.time ?? i), kw: num(p.kw ?? p.total_kw ?? p.load_kw) ?? 0 },
-  );
+const pct = (v: number | undefined) => (v === undefined ? undefined : Math.abs(v) <= 1.0001 ? v * 100 : v);
+
+function rowsFrom(ev: any): Row[] {
+  const raw = [ev.schedule, ev.optimal?.schedule, ev.plan?.schedule, ev.hours].find((x) => Array.isArray(x) && x.length) ?? [];
+  const priceMap = new Map<number, number>();
+  const pr = Array.isArray(ev.prices) ? ev.prices : ev.prices?.day_ahead ?? [];
+  for (const p of pr) {
+    const v = num(p.usd_mwh ?? p.price ?? p.lbmp);
+    if (v !== undefined) priceMap.set(hourOf(p.hour ?? p.ts), v);
+  }
+  return raw.map((r: any, i: number) => {
+    const hour = hourOf(r.hour ?? r.ts ?? r.time ?? i);
+    const signed = num(r.mw ?? r.net_mw ?? r.power_mw);
+    let charge = num(r.charge_mw ?? r.buy_mw ?? r.charge) ?? (signed !== undefined && signed < 0 ? -signed : 0);
+    let discharge = num(r.discharge_mw ?? r.sell_mw ?? r.discharge) ?? (signed !== undefined && signed > 0 ? signed : 0);
+    charge = Math.abs(charge);
+    discharge = Math.abs(discharge);
+    return {
+      hour,
+      price: num(r.price ?? r.usd_mwh ?? r.price_usd_mwh ?? r.lbmp) ?? priceMap.get(hour) ?? null,
+      charge_mw: charge,
+      discharge_mw: discharge,
+      soc_pct: pct(num(r.soc_pct ?? r.soc ?? r.fill_pct)) ?? null,
+    };
+  });
 }
 
-export function normalizePlan(ev: any, prices: PricePoint[]): Plan {
-  const b = ev.baseline ?? {};
-  const o = ev.optimal ?? {};
-  const s = ev.savings ?? {};
-  const c = ev.checks ?? {};
-  let optimal = loads(ev.schedule);
-  if (!optimal.length) optimal = loads(o);
-  const baseline = loads(b);
-  const cap = num(ev.cap_kw ?? c.cap_kw ?? o.cap_kw) ?? 3000;
-  const minSoc = num(c.min_soc ?? c.min_soc_at_departure ?? o.min_soc_at_departure ?? o.sim?.min_soc_at_departure);
-  const peak = num(c.peak_kw ?? o.peak_kw ?? o.sim?.peak_kw) ?? (optimal.length ? Math.max(...optimal.map((x) => x.kw)) : undefined);
-  const violList = c.violations ?? o.violations ?? o.sim?.violations;
+export function normalizePlan(ev: any): Plan {
+  const o = ev.optimal ?? ev.sim ?? {};
+  const rows = rowsFrom(ev);
+  const socs = rows.map((r) => r.soc_pct).filter((x): x is number => x !== null);
+  const minSoc = pct(pick(ev, ["checks.min_soc", "optimal.min_soc", "sim.min_soc", "min_soc"])) ?? (socs.length ? Math.min(...socs) : undefined);
+  const maxSoc = pct(pick(ev, ["checks.max_soc", "optimal.max_soc", "sim.max_soc", "max_soc"])) ?? (socs.length ? Math.max(...socs) : undefined);
+  const endSoc = pct(pick(ev, ["checks.end_soc", "optimal.end_soc", "sim.end_soc", "end_soc"])) ?? (socs.length ? socs[socs.length - 1] : undefined);
+  const cycles = pick(ev, ["checks.cycles", "optimal.cycles", "sim.cycles", "cycles"]);
+  const reserve = pct(pick(ev, ["reserve_pct", "constraints.reserve_pct", "battery.min_soc_pct", "checks.reserve_pct"]));
+  const violList = ev.checks?.violations ?? o.violations ?? ev.violations;
   const violations = Array.isArray(violList) ? violList.length : num(violList) ?? 0;
-  const sandbox: string | undefined =
-    c.sandbox_id ?? c.sandbox ?? ev.sandbox_id ?? ev.sandbox?.id ?? (typeof ev.sandbox === "string" ? ev.sandbox : undefined);
-  const sandboxIsLocal = !sandbox || /^local/i.test(String(sandbox)) || c.where === "local" || ev.sandbox?.kind === "local";
+  const sandbox = pickStr(ev, ["sandbox_id", "optimal.sandbox_id", "checks.sandbox_id", "sandbox.id", "sandbox"]);
+  const where = pickStr(ev, ["simulated_in", "optimal.where", "where"]);
+  const local = !sandbox || /^local/i.test(sandbox) || where === "local";
 
-  // Checks: use backend list if given, else derive.
-  let checks: Check[] = [];
-  if (Array.isArray(c)) {
-    checks = c.map((x: any) => ({ name: String(x.name ?? x.label ?? x.check), ok: !!(x.ok ?? x.pass ?? x.passed), detail: x.detail ?? x.value }));
+  let checks: Check[];
+  if (Array.isArray(ev.checks)) {
+    checks = ev.checks.map((x: any) => ({ name: String(x.name ?? x.label ?? x.check), ok: !!(x.ok ?? x.pass ?? x.passed), detail: x.detail ?? x.value }));
   } else {
-    const soc = minSoc !== undefined ? (minSoc <= 1.0001 ? minSoc * 100 : minSoc) : undefined;
+    const lo = reserve ?? 10;
+    const both = rows.some((r) => r.charge_mw > 1e-6 && r.discharge_mw > 1e-6);
     checks = [
-      { name: "Every bus at 90% or more by 5:00am", ok: c.all_buses_charged ?? (soc === undefined ? true : soc >= 90 - 1e-6), detail: soc !== undefined ? `min SOC ${soc.toFixed(1)}%` : undefined },
-      { name: "Site peak within cap", ok: c.peak_ok ?? (peak === undefined ? true : peak <= cap + 1e-6), detail: peak !== undefined ? `${fmtInt(peak)} / ${fmtInt(cap)} kW` : undefined },
-      { name: sandboxIsLocal ? "Simulated locally" : "Simulated in Daytona sandbox", ok: true, detail: sandboxIsLocal ? "Daytona unavailable, local subprocess" : String(sandbox) },
-      { name: "Constraint violations", ok: violations === 0, detail: String(violations) },
+      { name: `Fill stays between ${Math.round(lo)}% and 90%`, ok: minSoc === undefined || (minSoc >= lo - 0.01 && (maxSoc ?? 0) <= 90.01), detail: minSoc !== undefined ? `${minSoc.toFixed(0)}% to ${(maxSoc ?? 0).toFixed(0)}%` : undefined },
+      { name: "At most 1 full cycle (warranty)", ok: cycles === undefined || cycles <= 1.0001, detail: cycles !== undefined ? `${cycles.toFixed(2)} cycles` : undefined },
+      { name: "Never buys and sells in the same hour", ok: !both, detail: both ? "overlap found" : "0 overlapping hours" },
+      { name: "Ends at least 50% full", ok: endSoc === undefined || endSoc >= 49.99, detail: endSoc !== undefined ? `ends ${endSoc.toFixed(0)}%` : undefined },
+      { name: local ? "Simulated locally" : "Simulated in Daytona", ok: violations === 0, detail: local ? "Daytona unavailable" : sandbox },
     ];
   }
 
-  const evPrices: PricePoint[] = Array.isArray(ev.prices) ? ev.prices : Array.isArray(ev.prices?.day_ahead) ? ev.prices.day_ahead : prices;
-
   return {
     plan_id: ev.plan_id ?? ev.id,
-    baseline,
-    optimal,
-    prices: evPrices,
-    tonight_usd: num(s.tonight_usd) ?? 0,
-    monthly_usd: num(s.monthly_usd) ?? 0,
-    pct: num(s.pct),
-    baseline_cost: num(b.cost_usd ?? b.sim?.cost_usd),
-    optimal_cost: num(o.cost_usd ?? o.sim?.cost_usd),
+    date: ev.date ?? ev.day ?? ev.night,
+    rows,
+    profit_usd: pick(ev, ["profit_usd", "profit.optimal", "profit.tomorrow_usd", "profit_tomorrow_usd", "tomorrow_usd", "optimal.profit_usd", "sim.profit_usd", "savings.profit_usd", "profit"]) ?? 0,
+    baseline_profit_usd: pick(ev, ["baseline_profit_usd", "baseline_profit", "profit.baseline", "baseline.profit_usd"]),
+    revenue_usd: pick(ev, ["revenue_usd", "optimal.revenue_usd", "sim.revenue_usd"]),
+    cost_usd: pick(ev, ["cost_usd", "optimal.cost_usd", "sim.cost_usd"]),
+    backtest_total_usd: pick(ev, ["backtest_total_usd", "backtest.total", "backtest.optimal_profit", "backtest.totals.optimal_profit", "last30_usd", "profit_30d_usd"]),
+    cycles,
     min_soc: minSoc,
-    peak_kw: peak,
-    baseline_peak_kw: num(b.peak_kw) ?? (baseline.length ? Math.max(...baseline.map((x) => x.kw)) : undefined),
-    cap_kw: cap,
+    max_soc: maxSoc,
+    end_soc: endSoc,
+    reserve_pct: reserve,
     violations,
-    sandbox: sandboxIsLocal ? undefined : String(sandbox),
+    status: ev.status,
+    sandbox: local ? undefined : sandbox,
     checks,
     audio_url: audioFrom(ev),
-    voice_text: ev.voice_text ?? ev.script ?? ev.explanation,
+    voice_text: ev.voice_text ?? ev.message ?? ev.explanation,
   };
 }
 
@@ -127,18 +158,16 @@ export function fmtInt(n: number): string {
   return Math.round(n).toLocaleString("en-US");
 }
 export function fmtUsd(n: number, digits = 0): string {
-  return "$" + n.toLocaleString("en-US", { minimumFractionDigits: digits, maximumFractionDigits: digits });
+  const s = Math.abs(n).toLocaleString("en-US", { minimumFractionDigits: digits, maximumFractionDigits: digits });
+  return (n < 0 ? "-$" : "$") + s;
 }
 
-export async function getPrices(): Promise<PricePoint[]> {
-  if (MOCK) return mockPrices;
-  try {
-    const r = await fetch(`${API}/api/prices`);
-    const j = await r.json();
-    return Array.isArray(j) ? j : j.day_ahead ?? j.dam ?? j.prices ?? [];
-  } catch {
-    return [];
-  }
+export function backtestDay(d: any): BacktestDay {
+  return {
+    date: String(d.date ?? d.day),
+    baseline: pick(d, ["baseline_profit", "baseline_profit_usd", "baseline_usd", "baseline"]) ?? 0,
+    optimal: pick(d, ["optimal_profit", "optimal_profit_usd", "profit_usd", "optimal_usd", "optimal", "profit"]) ?? 0,
+  };
 }
 
 export async function getBacktest(): Promise<Backtest | null> {
@@ -154,18 +183,25 @@ export async function getBacktest(): Promise<Backtest | null> {
     }
   }
   const days: any[] = Array.isArray(j) ? j : j.days ?? j.results ?? j.per_day ?? [];
-  const norm = days.map((d) => ({
-    date: String(d.date),
-    baseline_usd: num(d.baseline_usd) ?? 0,
-    optimal_usd: num(d.optimal_usd) ?? 0,
-    saved_usd: num(d.saved_usd) ?? (num(d.baseline_usd) ?? 0) - (num(d.optimal_usd) ?? 0),
-  }));
+  const norm = days.map(backtestDay);
   const t = j.totals ?? j.total ?? {};
   return {
     days: norm,
-    total_saved: num(t.saved_usd ?? t) ?? norm.reduce((a, d) => a + d.saved_usd, 0),
-    total_baseline: num(t.baseline_usd),
+    total: pick(t, ["optimal_profit", "optimal_profit_usd", "profit_usd", "optimal"]) ?? norm.reduce((a, d) => a + d.optimal, 0),
+    total_baseline: pick(t, ["baseline_profit", "baseline_profit_usd", "baseline"]) ?? norm.reduce((a, d) => a + d.baseline, 0),
   };
+}
+
+/** Pull "night N/30 in sandbox X" progress out of any stream event. */
+export function progressFrom(e: any): Progress | null {
+  const n = num(e.n ?? e.night ?? e.i ?? e.done ?? e.day_index);
+  const of = num(e.of ?? e.total ?? e.days ?? e.count);
+  if (/backtest|progress/.test(String(e.kind)) && n !== undefined && of !== undefined)
+    return { n, of, sandbox: e.sandbox_id ?? e.sandbox, text: e.text };
+  const t = typeof e.text === "string" ? e.text : "";
+  const m = t.match(/night\s+(\d+)\s*(?:\/|of)\s*(\d+)/i);
+  if (m) return { n: +m[1], of: +m[2], sandbox: t.match(/sandbox\s+([\w-]+)/i)?.[1], text: t };
+  return null;
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -174,7 +210,7 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 export async function streamPlan(onEvent: (e: StreamEvent) => void, signal?: AbortSignal): Promise<void> {
   if (MOCK) {
     for (const e of mockPlanEvents) {
-      await sleep(e.kind === "status" ? 280 : 150);
+      await sleep(e.kind === "status" ? 260 : e.kind === "backtest" ? 60 : 150);
       if (signal?.aborted) return;
       onEvent(e as StreamEvent);
     }
@@ -183,7 +219,7 @@ export async function streamPlan(onEvent: (e: StreamEvent) => void, signal?: Abo
   const r = await fetch(`${API}/api/plan`, {
     method: "POST",
     headers: { "Content-Type": "application/json", Accept: "text/event-stream" },
-    body: JSON.stringify({ cap_kw: 3000 }),
+    body: JSON.stringify({}),
     signal,
   });
   if (!r.ok || !r.body) throw new Error(`plan request failed: HTTP ${r.status}`);
@@ -225,4 +261,38 @@ export async function approve(planId: string | undefined, approved: boolean): Pr
   });
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   return r.json().catch(() => ({}));
+}
+
+export async function getJSON(path: string): Promise<any> {
+  const r = await fetch(`${API}${path}`);
+  if (!r.ok) throw new Error(`HTTP ${r.status} ${await r.text().catch(() => "")}`);
+  return r.json();
+}
+export async function postJSON(path: string, body: unknown): Promise<any> {
+  const r = await fetch(`${API}${path}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  if (!r.ok) throw new Error(`HTTP ${r.status} ${await r.text().catch(() => "")}`);
+  return r.json();
+}
+
+export type Fact = {
+  id: string;
+  kind: string;
+  key: string;
+  value: any;
+  source?: string;
+  valid_from?: string;
+  valid_until?: string | null;
+  superseded_by?: string | null;
+  text?: string;
+};
+export type Memory = { backend?: string; facts: Fact[] };
+
+export async function getMemory(): Promise<Memory | null> {
+  if (MOCK) return mockMemory as Memory;
+  try {
+    const j = await getJSON("/api/memory?limit=30");
+    return { backend: j.status?.backend, facts: Array.isArray(j.facts) ? j.facts : [] };
+  } catch {
+    return null;
+  }
 }

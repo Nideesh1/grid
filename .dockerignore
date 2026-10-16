@@ -1,0 +1,16 @@
+.env
+.env.*
+!.env.example
+.venv
+.git
+data
+**/__pycache__
+**/*.pyc
+ui/node_modules
+ui/dist
+ui/screenshots
+ui/tsconfig.tsbuildinfo
+.agents
+.claude
+*.log
+.DS_Store

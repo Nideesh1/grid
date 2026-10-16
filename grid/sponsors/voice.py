@@ -54,26 +54,27 @@ import hashlib  # noqa: E402
 import json  # noqa: E402
 
 AGENT_FILE = DATA / "eleven_agent.json"
-AGENT_NAME = "grid night dispatcher"
+AGENT_NAME = "grid battery trader"
 AGENT_PROMPT = (
-    "You are the voice of GRID, the overnight energy dispatcher for a 40-bus electric bus depot in New York City. "
-    "You talk with the human night dispatcher. Always call get_plan first to read tonight's plan; quote only numbers "
-    "returned by tools (dollar savings tonight and per month, charging window, peak kW, safety violations, Daytona "
-    "sandbox). If the dispatcher gives a constraint such as 'bus 12 leaves at 04:00' or a new site cap, call replan "
-    "with it, wait for the result and read back the new savings and safety result. When the dispatcher clearly says "
-    "yes or approve, call approve with the plan_id from the latest plan; if they say no, call approve with approved "
-    "false. Keep every turn under 30 words, plain spoken English, no lists."
+    "You are the voice of GRID, an AI trader for a 10 megawatt, 40 megawatt-hour grid battery in New York City. It "
+    "buys power when NYISO day-ahead prices are cheap, stores it, and sells when prices are high, inside hard safety "
+    "limits, and you need the human dispatcher's approval. Always call get_plan first and quote only numbers returned "
+    "by tools: buy and sell windows, profit in dollars, the naive-rule profit, cycles, safety violations, the Daytona "
+    "sandbox. Pitch it like: 'Tomorrow I'll buy 2 to 5am and sell 5 to 8pm, profit 418 dollars. Approve?' If the "
+    "dispatcher gives a constraint such as 'keep 30 percent in reserve for the storm', 'only half a cycle today', "
+    "'don't sell before 6pm' or 'reset constraints', call replan with their words, wait, then read back the new profit "
+    "and safety result. When they clearly approve, call approve with the latest plan_id and approved true; if they "
+    "reject, approved false. Keep turns under 30 words, plain spoken English, no lists."
 )
-FIRST_MESSAGE = "Grid dispatcher here. Tonight's charging plan is ready. Want the numbers, or any buses with special departure times?"
+FIRST_MESSAGE = "Grid trader here. Tomorrow's battery trading plan is ready. Want the numbers, or any limits for tomorrow?"
 CLIENT_TOOLS = [
     {"type": "client", "name": "get_plan", "expects_response": True, "response_timeout_secs": 20,
-     "description": "Get tonight's latest charging plan: plan_id, savings tonight and per month, charging window, peak kW, violations, sandbox id.",
+     "description": "Get the latest battery trading plan: plan_id, buy and sell windows, profit, naive-rule profit, cycles, violations, sandbox id.",
      "parameters": {"type": "object", "properties": {}, "required": []}},
     {"type": "client", "name": "replan", "expects_response": True, "response_timeout_secs": 40,
-     "description": "Re-plan tonight with a new constraint, e.g. 'bus 12 leaves at 04:00', and/or a new site power cap in kW.",
-     "parameters": {"type": "object", "required": [], "properties": {
-         "constraint": {"type": "string", "description": "Constraint in plain words, e.g. 'bus 12 leaves at 04:00'"},
-         "cap_kw": {"type": "number", "description": "Optional site power cap in kW"}}}},
+     "description": "Re-plan with an operator constraint in plain words: reserve percent, cycle limit, no selling before an hour, no buying after an hour, or reset.",
+     "parameters": {"type": "object", "required": ["constraint"], "properties": {
+         "constraint": {"type": "string", "description": "e.g. 'keep 30% in reserve for the storm', 'only half a cycle today', \"don't sell before 6pm\", 'reset constraints'"}}}},
     {"type": "client", "name": "approve", "expects_response": True, "response_timeout_secs": 20,
      "description": "Record the dispatcher's decision on a plan.",
      "parameters": {"type": "object", "required": ["plan_id", "approved"], "properties": {

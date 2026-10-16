@@ -30,7 +30,7 @@ _err: dict = {"surreal": None}
 
 
 def surreal_on() -> bool:
-    return has("SURREAL_URL", "SURREAL_TOKEN", "SURREAL_CONTEXT")
+    return has("SURREAL_URL", "SURREAL_TOKEN")
 
 
 def backend() -> str:
@@ -39,8 +39,8 @@ def backend() -> str:
 
 def status() -> dict:
     return {"enabled": True, "backend": "surrealdb-agent-memory+sqlite-ledger" if surreal_on() else "sqlite",
-            "surreal_keys_present": has("SURREAL_URL", "SURREAL_TOKEN"), "surreal_context_set": has("SURREAL_CONTEXT"),
-            "surreal_error": _err["surreal"], "surreal_writes": _err.get("writes", 0), "last_query": _last["query"]}
+            "transport": "mcp" if surreal_on() else None, "surreal_error": _err["surreal"],
+            "surreal_writes": _err.get("writes", 0), "last_query": _last["query"], "corrections": _last["corrections"][:5]}
 
 
 def _now() -> str:
@@ -80,49 +80,52 @@ def _sqlite_recall(kind, key, history) -> list[dict]:
     return rows
 
 
-# ------------------------------------------------------------------ SurrealDB Agent Memory (hosted REST)
-# POST {SURREAL_URL}/api/v1/{SURREAL_CONTEXT}/facts  {text, infer, scopes, observed_at}  (snake_case write body)
-# POST {SURREAL_URL}/api/v1/{SURREAL_CONTEXT}/query  {query, k, lens}                    (camelCase read body)
-# Agent Memory extracts entities/attributes and supersedes older attribute values itself; the local SQLite ledger
-# keeps the exact valid_from/valid_until/superseded_by chain the UI shows. Writes go to both; recall prefers Agent Memory.
-SCOPE = "grid/depot"
-_last: dict = {"query": None}
+# ------------------------------------------------------------------ SurrealDB Agent Memory (hosted, MCP JSON-RPC)
+# POST {SURREAL_URL}/mcp tools/call remember {infer:"triples", triples:[{entity:{type,name}, key, value, occurred_at,
+# source_clause}], labels:[source=...]} -> Agent Memory supersedes the previous value of (entity, key) itself and
+# returns "corrections" [{key, old_value, new_value}]. recall {query, k} -> ranked hits (source=="attribute" = live).
+# The local SQLite ledger keeps the full valid_from/valid_until/superseded_by chain for the UI panel.
+_last: dict = {"query": None, "corrections": [], "writes": 0}
+ENTITY = {"type": "battery", "name": "nyc-battery-1"}
 
 
-def _am_url(path: str) -> str:
-    return f"{env('SURREAL_URL').rstrip('/')}/api/v1/{env('SURREAL_CONTEXT')}/{path}"
+def _mcp(tool: str, **args) -> dict:
+    r = httpx.post(env("SURREAL_URL").rstrip("/") + "/mcp", timeout=30, headers={
+        "Authorization": f"Bearer {env('SURREAL_TOKEN')}", "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream"},
+        json={"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": tool, "arguments": args}})
+    r.raise_for_status()
+    text = r.text
+    if text.lstrip().startswith(("event:", "data:")):  # streamable HTTP may answer as SSE
+        text = next(ln[5:].strip() for ln in text.splitlines() if ln.startswith("data:"))
+    res = json.loads(text)["result"]
+    if res.get("isError"):
+        raise RuntimeError(res["content"][0]["text"][:200])
+    return res.get("structuredContent") or {}
 
 
-def _am_headers() -> dict:
-    return {"Authorization": f"Bearer {env('SURREAL_TOKEN')}", "Content-Type": "application/json"}
-
-
-def _fact_text(f: dict) -> str:
+def _triple(f: dict) -> dict:
     v, k = f["value"], f["key"]
     if f["kind"] == "constraint":
-        parts = []
-        if v.get("departure_hour") is not None:
-            h = v["departure_hour"] % 24
-            parts.append(f"must depart at {int(h):02d}:{int(round(h % 1 * 60)):02d}")
-        if v.get("arrival_hour") is not None:
-            h = v["arrival_hour"] % 24
-            parts.append(f"arrives at {int(h):02d}:{int(round(h % 1 * 60)):02d}")
-        return f"Depot constraint: bus {v.get('bus_id')} {' and '.join(parts) or 'has default schedule'} (source {f['source']})."
+        return {"entity": ENTITY, "key": k, "value": json.dumps(v) if not isinstance(v, (str, int, float)) else str(v),
+                "source_clause": str(v.get("text") if isinstance(v, dict) and v.get("text") else f"{k} = {v}")}
     if f["kind"] == "price_forecast":
-        return f"NYISO day-ahead price forecast for N.Y.C. at {k} is ${v.get('usd_mwh')}/MWh (source {f['source']})."
+        return {"entity": {"type": "zone", "name": "NYISO N.Y.C."}, "key": f"da_price_{k[:13]}",
+                "value": f"{v.get('usd_mwh')}", "source_clause": f"day-ahead LBMP {k} = ${v.get('usd_mwh')}/MWh"}
     if f["kind"] == "plan":
-        return (f"Charging plan {v.get('plan_id')} for the night of {k} is {v.get('status')}: saves "
-                f"${v.get('tonight_usd')} tonight and ${v.get('monthly_usd')} per month (source {f['source']}).")
-    return f"{f['kind']} {k}: {json.dumps(v)} (source {f['source']})."
+        return {"entity": {"type": "plan", "name": f"trading day {k}"}, "key": "status",
+                "value": f"{v.get('status')} plan {v.get('plan_id')} profit ${v.get('profit_usd', v.get('tonight_usd'))}",
+                "source_clause": f"plan {v.get('plan_id')} for {k} is {v.get('status')}"}
+    return {"entity": {"type": "note", "name": f["kind"]}, "key": k, "value": json.dumps(v)[:300], "source_clause": f["kind"]}
 
 
-def _am_remember(f: dict) -> None:
-    body = {"text": _fact_text(f), "infer": "full", "scopes": [[SCOPE]], "observed_at": f["valid_from"]}
-    r = httpx.post(_am_url("facts"), headers=_am_headers(), json=body, timeout=20)
-    if r.status_code in (400, 403, 422) and "scope" in r.text.lower():  # scope not registered: write unscoped
-        body.pop("scopes")
-        r = httpx.post(_am_url("facts"), headers=_am_headers(), json=body, timeout=20)
-    r.raise_for_status()
+def _am_remember(f: dict) -> dict:
+    t = {**_triple(f), "occurred_at": f["valid_from"], "confidence": 0.95}
+    out = _mcp("remember", infer="triples", labels=[f"source={f['source']}", f"kind={f['kind']}"], triples=[t])
+    corr = (out.get("extraction") or {}).get("corrections") or []
+    if corr:
+        _last["corrections"] = (corr + _last["corrections"])[:10]
+    return out
 
 
 def ask(question: str, k: int = 8) -> dict:
@@ -130,16 +133,15 @@ def ask(question: str, k: int = 8) -> dict:
     with _span("QUERY", "recall"):
         if surreal_on():
             try:
-                r = httpx.post(_am_url("query"), headers=_am_headers(), json={"query": question, "k": k}, timeout=30)
-                r.raise_for_status()
-                j = r.json()
-                hits = [{"text": h.get("text") or h.get("content") or h.get("value") or json.dumps(h)[:200],
-                         "source": h.get("source"), "occurredAt": h.get("occurredAt")} for h in j.get("hits", [])]
+                j = _mcp("recall", query=question, k=k)
+                hits = [{"text": h.get("text"), "source": h.get("source"), "occurredAt": h.get("occurredAt"),
+                         "score": h.get("score")} for h in j.get("hits", [])]
                 _last["query"] = {"question": question, "tier": j.get("tier"), "n": len(hits)}
-                return {"backend": "surrealdb-agent-memory", "tier": j.get("tier"), "hits": hits}
+                return {"backend": "surrealdb-agent-memory", "tier": j.get("tier"), "hits": hits,
+                        "corrections": _last["corrections"]}
             except Exception as e:  # noqa: BLE001
                 _err["surreal"] = f"{type(e).__name__}: {str(e)[:120]}"
-                log.warning("agent memory query failed: %s", _err["surreal"])
+                log.warning("agent memory recall failed: %s", _err["surreal"])
         return {"backend": "sqlite", "tier": "ledger", "hits": [{"text": c} for c in changes_since()]}
 
 
@@ -167,11 +169,13 @@ def _span(op: str, kind: str):
         "grid.memory.kind": kind, "server.address": "surrealdb" if b == "surrealdb" else "memory.db"})
 
 
-def remember(kind: str, key: str, value, source: str = "agent", mirror: bool = True) -> dict:
+def remember(kind: str, key: str, value, source: str = "agent", mirror: bool | None = None) -> dict:
     f = {"id": uuid.uuid4().hex[:12], "kind": kind, "key": str(key), "value": value, "source": source,
          "valid_from": _now(), "valid_until": None, "superseded_by": None}
     with _span("UPSERT", kind):
         _sqlite_remember(f)
+    if mirror is None:
+        mirror = kind != "price_forecast"  # forecasts: mirrored in one batch by remember_forecasts()
     if mirror and surreal_on():
         ctx = otel_context.get_current()
 
@@ -180,8 +184,9 @@ def remember(kind: str, key: str, value, source: str = "agent", mirror: bool = T
             try:
                 with _tracer.start_as_current_span("POST facts", kind=trace.SpanKind.CLIENT, attributes={
                         "db.system": "surrealdb", "db.operation": "REMEMBER", "db.collection.name": "facts",
-                        "db.namespace": "agent-memory", "grid.memory.kind": kind, "server.address": "surreal.cloud"}):
-                    _am_remember(f)
+                        "db.namespace": "agent-memory", "grid.memory.kind": kind, "server.address": "surreal.cloud"}) as dsp:
+                    out = _am_remember(f)
+                    dsp.set_attribute("grid.memory.corrections", len((out.get("extraction") or {}).get("corrections") or []))
                 _err["writes"] = _err.get("writes", 0) + 1
                 _err["surreal"] = None
             except Exception as e:  # noqa: BLE001
@@ -192,6 +197,34 @@ def remember(kind: str, key: str, value, source: str = "agent", mirror: bool = T
 
         threading.Thread(target=_bg, daemon=True).start()
     return f
+
+
+def remember_forecasts(rows: list[dict], source: str) -> None:
+    """Hourly day-ahead forecasts: SQLite ledger per hour + ONE Agent Memory write with all triples (each hour's new
+    forecast supersedes the previous forecast for that hour)."""
+    facts = [remember("price_forecast", h["ts"], {"usd_mwh": h["usd_mwh"]}, source, mirror=False) for h in rows]
+    if not (surreal_on() and facts):
+        return
+    ctx = otel_context.get_current()
+
+    def _bg():
+        tok = otel_context.attach(ctx)
+        try:
+            with _tracer.start_as_current_span("POST facts", kind=trace.SpanKind.CLIENT, attributes={
+                    "db.system": "surrealdb", "db.operation": "REMEMBER", "db.collection.name": "facts",
+                    "db.namespace": "agent-memory", "grid.memory.kind": "price_forecast", "server.address": "surreal.cloud"}):
+                triples = [{**_triple(f), "occurred_at": f["valid_from"], "confidence": 0.9} for f in facts]
+                out = _mcp("remember", infer="triples", labels=[f"source={source[:60]}", "kind=price_forecast"], triples=triples)
+                corr = (out.get("extraction") or {}).get("corrections") or []
+                if corr:
+                    _last["corrections"] = (corr + _last["corrections"])[:10]
+            _err["writes"] = _err.get("writes", 0) + 1
+        except Exception as e:  # noqa: BLE001
+            _err["surreal"] = f"{type(e).__name__}: {str(e)[:120]}"
+        finally:
+            otel_context.detach(tok)
+
+    threading.Thread(target=_bg, daemon=True).start()
 
 
 def recall(kind: str, key: str | None = None, history: bool = False) -> list[dict]:
@@ -206,5 +239,5 @@ def recent(limit: int = 20) -> list[dict]:
             "SELECT * FROM fact WHERE kind != 'price_forecast' OR superseded_by IS NOT NULL ORDER BY valid_from DESC LIMIT ?", (limit,))]
     for r in rows:
         r["value"] = json.loads(r["value"])
-        r["text"] = _fact_text(r)
+        r["text"] = (r["value"].get("text") if isinstance(r["value"], dict) and r["value"].get("text") else _triple(r)["source_clause"])
     return rows

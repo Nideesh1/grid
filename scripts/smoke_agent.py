@@ -33,11 +33,10 @@ def in_process(date: str | None) -> int:
                 print("ERROR", ev["text"])
         if not plan:
             return 1
-        s = plan["savings"]
-        print(f"plan {plan['plan_id']} night {plan['date']} window {plan['charging_window']} via {plan['simulated_in']} "
-              f"{plan['sandbox_id']}")
-        print(f"  saves ${s['tonight_usd']:,.2f} tonight, ${s['monthly_usd']:,.2f}/month ({s['pct']}%), "
-              f"violations={len(plan['optimal']['violations'])}, peak {plan['optimal']['peak_kw']} kW")
+        print(f"plan {plan['plan_id']} day {plan['date']} buy {plan['buy_windows']} sell {plan['sell_windows']} via "
+              f"{plan['simulated_in']} {plan['sandbox_id']}")
+        print(f"  profit ${plan['profit_usd']:,.2f} vs naive ${plan['baseline_profit_usd']:,.2f}, "
+              f"violations={len(plan['optimal']['violations'])}, cycles {plan['optimal']['cycles']}, constraints {plan['constraints']}")
         print(f"  llm={plan['llm']} explanation: {plan['explanation']}")
         print(f"  message: {plan['message']}")
         print(f"  evals: {json.dumps({k: v['label'] for k, v in plan['evals'].items()})}  voice: {plan['voice_url']}")
@@ -45,7 +44,7 @@ def in_process(date: str | None) -> int:
         hist = memory.recall("plan", plan["date"], history=True)
         print(f"  memory[{memory.backend()}] plan facts for night: {len(hist)} "
               f"(active={sum(1 for f in hist if not f['valid_until'])}, superseded={sum(1 for f in hist if f['superseded_by'])})")
-        ok = not plan["optimal"]["violations"] and plan["savings"]["tonight_usd"] > 0
+        ok = not plan["optimal"]["violations"] and plan["profit_usd"] > 0
         print("SMOKE", "PASS" if ok else "FAIL")
         return 0 if ok else 1
     finally:
@@ -65,7 +64,7 @@ def via_api(api: str, date: str | None) -> int:
     h = c.get("/api/health").json()
     print("health:", json.dumps({k: v.get("enabled") for k, v in h["sponsors"].items()}), "llm:", h["llm"]["configured"])
     p = c.get("/api/prices").json()
-    print(f"prices: {len(p['day_ahead'])} day-ahead rows, {len(p['real_time'])} real-time rows")
+    print(f"prices: {len(p['day_ahead'])} day-ahead rows for {p['date']}")
     plan = None
     with c.stream("POST", "/api/plan", json={"date": date} if date else {}) as r:
         for line in r.iter_lines():
@@ -79,13 +78,13 @@ def via_api(api: str, date: str | None) -> int:
                     print("  ERROR", ev["text"])
     if not plan:
         return 1
-    print(f"plan {plan['plan_id']}: ${plan['savings']['tonight_usd']:,.2f} tonight, sandbox {plan['sandbox_id']}, llm {plan['llm']}")
+    print(f"plan {plan['plan_id']}: profit ${plan['profit_usd']:,.2f} (naive ${plan['baseline_profit_usd']:,.2f}), sandbox {plan['sandbox_id']}, llm {plan['llm']}")
     print("  message:", plan["message"])
     print("approve:", c.post("/api/approve", json={"plan_id": plan["plan_id"], "approved": True}).json())
     v = c.get(f"/api/voice/{plan['plan_id']}")
     print("voice:", v.status_code, v.headers.get("content-type"), len(v.content), "bytes")
     t = time.time()
-    b = c.get("/api/backtest", params={"days": 30}).json()
+    b = c.get("/api/backtest", params={"days": 30, "sandbox": 1}).json()
     print(f"backtest: {b['totals']} ({time.time() - t:.1f}s)")
     return 0
 

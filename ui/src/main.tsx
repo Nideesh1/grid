@@ -1,6 +1,7 @@
 import { StrictMode, Suspense, lazy } from "react";
 import { createRoot } from "react-dom/client";
 import App from "./App";
+import { ConversationProvider } from "@elevenlabs/react";
 import "./styles.css";
 
 const Backend = lazy(() => import("./Backend"));
@@ -13,7 +14,9 @@ createRoot(document.getElementById("root")!).render(
         <Backend />
       </Suspense>
     ) : (
-      <App />
+      <ConversationProvider>
+        <App />
+      </ConversationProvider>
     )}
   </StrictMode>,
 );

@@ -26,16 +26,16 @@ from opentelemetry import trace  # noqa: E402
 from grid.config import DATA, setup_tracing  # noqa: E402
 
 OUT = DATA / "arize_loop"
-JUDGE = ("You grade a night-shift energy dispatcher message for an electric bus depot. It is CLEAR_AND_COMPLETE if it "
-         "states (1) when buses charge, (2) tonight's dollar savings, (3) the monthly savings, (4) the safety result, "
-         "and (5) asks for a yes/no approval, in plain language a dispatcher can act on. Return JSON "
+JUDGE = ("You grade an AI battery trader's explanation + spoken message to a grid dispatcher. It is CLEAR_AND_COMPLETE "
+         "if it states (1) when it buys, (2) when it sells, (3) the dollar profit, (4) the safety result, and (5) asks "
+         "for approval, in plain language a dispatcher can act on. Return JSON "
          "{\"label\": \"pass\"|\"fail\", \"score\": 0..1, \"explanation\": one sentence}.")
 
 
 def rule_judge(text: str) -> dict:
-    parts = {"window": bool(re.search(r"\d{1,2}:\d{2}|\b\d{1,2}\s?(am|pm)\b|midnight|overnight", text, re.I)),
-             "tonight $": bool(re.search(r"\$[\d,]+.{0,40}tonight|tonight.{0,40}\$[\d,]+", text, re.I)),
-             "monthly $": bool(re.search(r"month", text, re.I)),
+    parts = {"buy": bool(re.search(r"\b(buy|charg)", text, re.I)),
+             "sell": bool(re.search(r"\b(sell|discharg)", text, re.I)),
+             "profit $": bool(re.search(r"profit.{0,40}\$[\d,]+|\$[\d,]+.{0,40}profit", text, re.I)),
              "safety": bool(re.search(r"violation|safety|safe", text, re.I)),
              "approval ask": bool(re.search(r"approve|yes or no|\?", text, re.I))}
     score = sum(parts.values()) / len(parts)
@@ -68,9 +68,14 @@ def llm_judge(text: str) -> dict:
 
 
 def nights(n: int) -> list[str]:
-    from grid.prices import history
+    from grid.prices import day_ahead
 
-    return list(history(n + 2, "rt").keys())[-n:]
+    out, d = [], date.today() - timedelta(days=1)
+    while len(out) < n:
+        if len(day_ahead(d)) >= 23:
+            out.append(d.isoformat())
+        d -= timedelta(days=1)
+    return out[::-1]
 
 
 def run(version: str, dataset: list[str]) -> dict:
@@ -92,10 +97,14 @@ def run(version: str, dataset: list[str]) -> dict:
                 continue
             text = plan["explanation"] + " " + plan["message"]
             judged = llm_judge(text)
-            evals = {**plan["evals"], "clear_and_complete": judged}
+            words = len(plan["message"].split())
+            spoken_ok = words <= 30 and "$" in plan["message"] and re.search(r"approve", plan["message"], re.I) is not None
+            concise = {"label": "pass" if spoken_ok else "fail", "score": 1.0 if spoken_ok else 0.0,
+                       "explanation": f"{words} words; needs <=30 words, a $ profit and an approval ask (it is read aloud)"}
+            evals = {**plan["evals"], "clear_and_complete": judged, "voice_ready": concise}
             arize.annotate(exp, evals)
             exp.set_attribute("output.value", plan["message"])
-            rows.append({"night": d, "plan_id": plan["plan_id"], "llm": plan["llm"], "tonight_usd": plan["savings"]["tonight_usd"],
+            rows.append({"night": d, "plan_id": plan["plan_id"], "llm": plan["llm"], "profit_usd": plan["profit_usd"],
                          "message": plan["message"], "explanation": plan["explanation"],
                          **{k: v["label"] for k, v in evals.items()}, "judge_note": judged["explanation"]})
     ok = [r for r in rows if not r.get("error")]
@@ -104,7 +113,8 @@ def run(version: str, dataset: list[str]) -> dict:
         return round(sum(r[k] == "pass" for r in ok) / max(len(ok), 1), 2)
 
     res = {"version": version, "n": len(ok), "grounded_savings": rate("grounded_savings"),
-           "constraint_check": rate("constraint_check"), "clear_and_complete": rate("clear_and_complete"), "rows": rows}
+           "constraint_check": rate("constraint_check"), "clear_and_complete": rate("clear_and_complete"),
+           "voice_ready": rate("voice_ready"), "rows": rows}
     OUT.mkdir(parents=True, exist_ok=True)
     (OUT / f"{version}.json").write_text(json.dumps(res, indent=2))
     return res
@@ -126,11 +136,11 @@ if __name__ == "__main__":
         print(f"dataset: {len(ds)} real NYISO nights {ds[0]} .. {ds[-1]}")
         results = [run(v, ds) for v in (a.baseline, a.candidate)]
         print(f"llm used: {agent.llm_status()}")
-        print(f"{'version':<10}{'n':>3}{'grounded_savings':>18}{'constraint_check':>18}{'clear_and_complete':>20}")
+        print(f"{'version':<10}{'n':>3}{'grounded':>10}{'safety':>8}{'clear':>8}{'voice_ready':>13}")
         for r in results:
-            print(f"{r['version']:<10}{r['n']:>3}{r['grounded_savings']:>18}{r['constraint_check']:>18}{r['clear_and_complete']:>20}")
+            print(f"{r['version']:<10}{r['n']:>3}{r['grounded_savings']:>10}{r['constraint_check']:>8}{r['clear_and_complete']:>8}{r['voice_ready']:>13}")
         b, c = results
-        better = (c["grounded_savings"] + c["clear_and_complete"]) >= (b["grounded_savings"] + b["clear_and_complete"])
+        better = (c["grounded_savings"] + c["clear_and_complete"] + c["voice_ready"]) >= (b["grounded_savings"] + b["clear_and_complete"] + b["voice_ready"])
         print(f"winner: {c['version'] if better else b['version']}  (results in {OUT})")
     finally:
         daytona_sim.shutdown()
