@@ -91,7 +91,7 @@ function Steps({ t }: { t: Turn }) {
   );
 }
 
-export default function AskTrader({ battery, autoStart = true }: { battery: Record<string, unknown>; autoStart?: boolean }) {
+export default function AskTrader({ battery, autoStart = false }: { battery: Record<string, unknown>; autoStart?: boolean }) {
   const [q, setQ] = useState("");
   const [turn, setTurn] = useState<Turn | null>(null);
   const busy = !!turn?.live;

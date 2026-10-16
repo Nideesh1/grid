@@ -48,11 +48,26 @@ def _sandbox():
     from daytona import Daytona, DaytonaConfig
 
     _state["client"] = Daytona(DaytonaConfig(api_key=env("DAYTONA_API_KEY")))
-    sb = _state["client"].create()
+    try:  # never auto-stop while the API is up (Daytona stops idle sandboxes after 15 min by default)
+        from daytona import CreateSandboxFromSnapshotParams
+
+        sb = _state["client"].create(CreateSandboxFromSnapshotParams(language="python", auto_stop_interval=0))
+    except Exception:  # noqa: BLE001
+        sb = _state["client"].create()
     sb.process.exec("mkdir -p grid && touch grid/__init__.py")
     _state["sandbox"] = sb
     log.info("daytona sandbox %s created", sb.id)
     return sb
+
+
+def _reset_sandbox() -> None:
+    """The shared sandbox stopped or vanished: drop it so the next call creates a fresh one."""
+    sb, _state["sandbox"] = _state["sandbox"], None
+    if sb is not None and _state.get("client") is not None:
+        try:
+            _state["client"].delete(sb)
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def sandbox_id() -> str | None:
@@ -192,18 +207,21 @@ def call(fn: str, *args, **kwargs) -> dict:
         jobcm = _nullcm()
     with jobcm:
         if enabled():
-            try:
-                with _lock:
-                    sb = _sandbox()
-                    sb.fs.upload_files(_files(inputs))
-                    r = sb.process.exec("python3 run.py", timeout=120)
-                    res = _parse(r.result)
-                    _state["runs"] += 1
-                    _state["error"] = None
-                    return {"result": res, "where": "daytona", "sandbox_id": sb.id, "elapsed_s": round(time.time() - t0, 2)}
-            except Exception as e:  # noqa: BLE001
-                _state["error"] = f"{type(e).__name__}: {str(e)[:160]}"
-                log.warning("daytona call failed, local fallback: %s", _state["error"])
+            for attempt in (1, 2):  # a stopped/vanished sandbox gets replaced once
+                try:
+                    with _lock:
+                        sb = _sandbox()
+                        sb.fs.upload_files(_files(inputs))
+                        r = sb.process.exec("python3 run.py", timeout=120)
+                        res = _parse(r.result)
+                        _state["runs"] += 1
+                        _state["error"] = None
+                        return {"result": res, "where": "daytona", "sandbox_id": sb.id, "elapsed_s": round(time.time() - t0, 2)}
+                except Exception as e:  # noqa: BLE001
+                    _state["error"] = f"{type(e).__name__}: {str(e)[:160]}"
+                    log.warning("daytona call failed (attempt %d): %s", attempt, _state["error"])
+                    with _lock:
+                        _reset_sandbox()
         return {"result": _local_call(inputs), "where": "local", "sandbox_id": None, "elapsed_s": round(time.time() - t0, 2)}
 
 
