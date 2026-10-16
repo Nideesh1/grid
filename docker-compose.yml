@@ -1,0 +1,7 @@
+services:
+  agentglow:
+    image: python:3.12-slim
+    command: sh -c "pip install --no-cache-dir agentglow==0.4.9 && agentglow serve --host 0.0.0.0 --port 8104"
+    ports:
+      - "8104:8104"
+    restart: unless-stopped

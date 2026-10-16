@@ -1,0 +1,139 @@
+"""Daytona: run optimize.simulate() for a plan inside an isolated Daytona sandbox.
+
+Uploads grid/{optimize,depot,bill}.py + inputs.json, runs a tiny runner, parses JSON between markers.
+One sandbox per API process (lazy, reused, deleted on shutdown). Fallback: local subprocess, flagged "local".
+"""
+from __future__ import annotations
+
+import json
+import logging
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+from pathlib import Path
+
+from grid.config import ROOT, env, has
+
+log = logging.getLogger("grid.daytona")
+MODULES = ["optimize.py", "depot.py", "bill.py"]
+MARK = "@@GRID_RESULT@@"
+RUNNER = f"""
+import json, sys
+sys.path.insert(0, '.')
+from grid.optimize import simulate
+from grid.depot import Depot
+inp = json.load(open('inputs.json'))
+res = simulate(inp['plan'], Depot.from_dict(inp['depot']), inp['prices'])
+print('{MARK}' + json.dumps(res, default=float))
+"""
+
+_lock = threading.Lock()
+_state: dict = {"client": None, "sandbox": None, "error": None, "runs": 0}
+
+
+def enabled() -> bool:
+    return has("DAYTONA_API_KEY")
+
+
+def status() -> dict:
+    sb = _state["sandbox"]
+    return {"enabled": enabled(), "sandbox_id": getattr(sb, "id", None), "runs": _state["runs"], "error": _state["error"]}
+
+
+def _sandbox():
+    if _state["sandbox"] is not None:
+        return _state["sandbox"]
+    from daytona import Daytona, DaytonaConfig
+
+    _state["client"] = Daytona(DaytonaConfig(api_key=env("DAYTONA_API_KEY")))
+    sb = _state["client"].create()
+    sb.process.exec("mkdir -p grid && touch grid/__init__.py")
+    _state["sandbox"] = sb
+    log.info("daytona sandbox %s created", sb.id)
+    return sb
+
+
+def sandbox_id() -> str | None:
+    """Create (or reuse) the sandbox and return its id; used for the status line before the run."""
+    if not enabled():
+        return None
+    with _lock:
+        try:
+            return _sandbox().id
+        except Exception as e:  # noqa: BLE001
+            _state["error"] = type(e).__name__
+            return None
+
+
+def _payload(plan, depot, prices) -> bytes:
+    d = depot.to_dict() if hasattr(depot, "to_dict") else depot
+    return json.dumps({"plan": plan, "depot": d, "prices": prices}, default=float).encode()
+
+
+def _parse(out: str) -> dict:
+    for line in (out or "").splitlines():
+        if line.startswith(MARK):
+            return json.loads(line[len(MARK):])
+    raise RuntimeError(f"no result in sandbox output: {(out or '')[-400:]}")
+
+
+def _local(plan, depot, prices) -> dict:
+    with tempfile.TemporaryDirectory() as td:
+        Path(td, "inputs.json").write_bytes(_payload(plan, depot, prices))
+        Path(td, "run.py").write_text(RUNNER.replace("sys.path.insert(0, '.')", f"sys.path.insert(0, {str(ROOT)!r})"))
+        p = subprocess.run([sys.executable, "run.py"], cwd=td, capture_output=True, text=True, timeout=120)
+        return _parse(p.stdout + p.stderr)
+
+
+def simulate_in_sandbox(plan, depot, prices) -> dict:
+    """Returns simulate() output plus {"where": "daytona"|"local", "sandbox_id", "elapsed_s"}."""
+    t0 = time.time()
+    try:
+        import agentglow
+
+        jobcm = agentglow.job(f"sim-{depot.date if hasattr(depot, 'date') else 'night'}", kind="daytona-sim")
+    except Exception:  # noqa: BLE001
+        jobcm = None
+    try:
+        if jobcm:
+            jobcm.__enter__()
+        if enabled():
+            try:
+                with _lock:
+                    sb = _sandbox()
+                    files = [(_payload(plan, depot, prices), "inputs.json"), (RUNNER.encode(), "run.py")]
+                    for m in MODULES:
+                        files.append(((ROOT / "grid" / m).read_bytes(), f"grid/{m}"))
+                    from daytona import FileUpload
+
+                    sb.fs.upload_files([FileUpload(source=s, destination=d) for s, d in files])
+                    r = sb.process.exec("python3 run.py", timeout=120)
+                    res = _parse(r.result)
+                    _state["runs"] += 1
+                    _state["error"] = None
+                    return {**res, "where": "daytona", "sandbox_id": sb.id, "elapsed_s": round(time.time() - t0, 2)}
+            except Exception as e:  # noqa: BLE001
+                _state["error"] = f"{type(e).__name__}: {str(e)[:160]}"
+                log.warning("daytona run failed, falling back to local: %s", _state["error"])
+                _state["sandbox"] = None if "not found" in str(e).lower() else _state["sandbox"]
+        res = _local(plan, depot, prices)
+        return {**res, "where": "local", "sandbox_id": None, "elapsed_s": round(time.time() - t0, 2)}
+    finally:
+        if jobcm:
+            try:
+                jobcm.__exit__(None, None, None)
+            except Exception:  # noqa: BLE001
+                pass
+
+
+def shutdown() -> None:
+    sb, c = _state["sandbox"], _state["client"]
+    _state["sandbox"] = None
+    if sb is not None and c is not None:
+        try:
+            c.delete(sb)
+            log.info("daytona sandbox %s deleted", sb.id)
+        except Exception as e:  # noqa: BLE001
+            log.warning("daytona delete failed: %s", type(e).__name__)

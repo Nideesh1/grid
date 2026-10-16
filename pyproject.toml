@@ -1,0 +1,19 @@
+[project]
+name = "grid"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "agentglow==0.4.9",
+    "arize-otel>=0.14.1",
+    "daytona>=0.224.1",
+    "fastapi>=0.143.3",
+    "highspy>=1.15.1",
+    "httpx>=0.28.1",
+    "mistralai>=3.2.0",
+    "numpy>=2.4.6",
+    "openinference-instrumentation-mistralai>=2.2.2",
+    "python-dotenv>=1.2.4",
+    "scipy>=1.17.1",
+    "sse-starlette>=3.5.0",
+    "uvicorn[standard]>=0.54.0",
+]
