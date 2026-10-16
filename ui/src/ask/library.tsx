@@ -4,6 +4,7 @@ import { createLibrary, defineComponent } from "@openuidev/react-lang";
 import { useMemo, type ReactNode } from "react";
 import { Bar, CartesianGrid, Cell, ComposedChart, Line, ReferenceLine, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 import { z } from "zod";
+import { pageComponents } from "./components";
 
 const GREEN = "#38f28a";
 const GOLD = "#e8b64a";
@@ -67,6 +68,8 @@ const BuySellChart = defineComponent({
       [props.hours],
     );
     const ps = data.map((d) => d.price).filter(num);
+    const mw = Math.max(0.1, ...data.map((d) => Math.max(-d.buy, d.sell)));
+    const dom = Math.ceil(mw * 1.1 * 10) / 10;
     const hi = ps.length ? Math.max(...ps) : 0;
     return (
       <Card className="wide" tag="buy and sell by hour" right={<span className="ask-legend"><b style={{ color: GREEN }}>buy</b> <b style={{ color: GOLD }}>sell</b> <b style={{ color: RED }}>price</b> <b style={{ color: "#e8e6e1" }}>SOC</b></span>}>
@@ -75,7 +78,7 @@ const BuySellChart = defineComponent({
           <ComposedChart data={data} margin={{ top: 12, right: 4, bottom: 0, left: -8 }}>
             <CartesianGrid stroke="#1c1b19" vertical={false} />
             <XAxis dataKey="label" stroke={MUTED} tickLine={false} tick={{ fontSize: 11, fontFamily: "JetBrains Mono" }} interval={2} />
-            <YAxis yAxisId="mw" stroke={MUTED} tick={{ fontSize: 11, fontFamily: "JetBrains Mono" }} width={44} domain={[-10, 10]} tickFormatter={(v) => `${v}MW`} />
+            <YAxis yAxisId="mw" stroke={MUTED} tick={{ fontSize: 11, fontFamily: "JetBrains Mono" }} width={44} domain={[-dom, dom]} ticks={[-dom, -dom / 2, 0, dom / 2, dom]} tickFormatter={(v) => `${+(+v).toFixed(1)}MW`} />
             <YAxis yAxisId="p" orientation="right" stroke={MUTED} tick={{ fontSize: 11, fontFamily: "JetBrains Mono" }} width={44} tickFormatter={(v) => `$${v}`} />
             <YAxis yAxisId="soc" hide domain={[0, 100]} />
             <Tooltip contentStyle={TIP} formatter={(v: number, k: string) => (k === "price" ? [`$${v}/MWh`, "price"] : k === "soc_pct" ? [`${v}%`, "SOC"] : [`${Math.abs(v)} MW`, k])} />
@@ -105,7 +108,7 @@ const SafetyChecks = defineComponent({
       <Card tag="safety checks" right={<span className={bad ? "red" : "ask-ok"}>{bad ? `${bad} failed` : "all passed"}</span>}>
         <ul className="ask-checks">
           {items.map((c, i) => (
-            <li key={i} className={c.ok ? "" : "bad"}><span className="mk">{c.ok ? "✓" : "×"}</span><b>{c.name}</b><span className="dim">{c.detail}</span></li>
+            <li key={i} className={c.ok ? "" : "bad"} title={c.detail ?? undefined}><span className="mk">{c.ok ? "✓" : "×"}</span><b>{c.name}</b>{!c.ok && c.detail && <span className="dim">{c.detail}</span>}</li>
           ))}
         </ul>
       </Card>
@@ -186,7 +189,7 @@ const Evidence = defineComponent({
 });
 
 export const library = createLibrary({
-  components: [Stack, ProfitHeadline, BuySellChart, Compare, BacktestBars, SafetyChecks, Narrative, Evidence],
+  components: [Stack, ProfitHeadline, BuySellChart, Compare, BacktestBars, SafetyChecks, Narrative, Evidence, ...pageComponents],
   root: "Stack",
 });
 
@@ -201,6 +204,8 @@ export const askPrompt = () =>
       "What-if questions: ProfitHeadline (the what-if profit), Compare (default vs what-if profit, reserve, cycles), BuySellChart(title, HOURS), SafetyChecks(CHECKS).",
       "History questions: ProfitHeadline (total optimal profit), BacktestBars(title, DAYS), Compare (optimal vs simple rule totals).",
       "HOURS, DAYS and CHECKS are bare placeholders the server fills in; never type those arrays yourself and never quote them.",
+      "Page components: LivePrice() and ZoneMap() read live prices themselves when called with no args. PlayTomorrow(HOURS, profit, battery), HomesPowered(HOURS), BidsTable(BIDS, date, HOURS), ScaleSlider({profit_usd, hours: HOURS, avg_daily_profit}, battery), BacktestCalendar(DAYS, totals), MemoryTimeline(), ApproveCard(plan_id, profit, message).",
+      "Show the plan for tomorrow: ProfitHeadline, BuySellChart, PlayTomorrow, SafetyChecks, ApproveCard. Show the grid: LivePrice, ZoneMap. Show my bids: BidsTable, ApproveCard. Last 30 days: ProfitHeadline, BacktestCalendar, BacktestBars, Compare.",
       "No em dashes or en dashes.",
     ],
   });

@@ -50,3 +50,8 @@
 .ask-row b { font-weight: 500; }
 .ask-narrative { grid-column: 1 / -1; font: 400 20px/1.4 var(--serif); margin: 0; padding: 16px 0; border-bottom: 1px solid var(--rule); }
 .ask-evidence { font: 11px var(--mono); color: var(--muted); padding: 10px 0; letter-spacing: .02em; }
+.ask-top { margin-top: 0; padding: 30px 0 22px; border-bottom: 1px solid var(--rule); }
+.ask-top .ask-search { border-bottom: 1px solid var(--ink); padding-bottom: 10px; }
+.ask-top .ask-search input { font-size: clamp(22px, 2.8vw, 32px); }
+.ask-top .ask-loader { flex-direction: column; align-items: center; text-align: center; }
+.ask-top .ask-loader ol { display: flex; flex-direction: column; align-items: center; }

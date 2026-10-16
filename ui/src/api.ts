@@ -276,7 +276,7 @@ export async function streamGet(path: string, onEvent: (e: StreamEvent) => void,
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 /** POST /api/plan and stream SSE events. */
-export async function streamPlan(onEvent: (e: StreamEvent) => void, signal?: AbortSignal): Promise<void> {
+export async function streamPlan(onEvent: (e: StreamEvent) => void, signal?: AbortSignal, fast = false): Promise<void> {
   if (MOCK) {
     for (const e of mockPlanEvents) {
       await sleep(e.kind === "status" ? 260 : e.kind === "backtest" ? 60 : 150);
@@ -285,10 +285,10 @@ export async function streamPlan(onEvent: (e: StreamEvent) => void, signal?: Abo
     }
     return;
   }
-  const r = await fetch(`${API}/api/plan`, {
+  const r = await fetch(`${API}/api/plan${fast ? "?fast=1" : ""}`, {
     method: "POST",
     headers: { "Content-Type": "application/json", Accept: "text/event-stream" },
-    body: JSON.stringify({}),
+    body: JSON.stringify(fast ? { fast: true } : {}),
     signal,
   });
   await readSSE(r, onEvent);

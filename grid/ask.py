@@ -162,6 +162,72 @@ def t_backtest(state: dict, days: int = 7) -> dict:
             "note": "pass DAYS (bare placeholder) to BacktestBars"}
 
 
+def t_grid_now(state: dict) -> dict:
+    from grid import api  # lazy: api imports this module
+
+    z = api.get_price_zones()
+    zones = [{"zone": r["zone"], "usd_mwh": r["usd_mwh"], "ts": r["ts"]} for r in z.get("zones", [])]
+    state["ZONES"] = zones
+    nyc = next((r for r in zones if r["zone"] == "N.Y.C."), None)
+    rt = optimize.hourly_prices(prices.real_time(date.today()) or [])
+    return {"source": z.get("source"), "as_of": z.get("ts"), "nyc_now_usd_mwh": nyc and nyc["usd_mwh"],
+            "zones": zones, "nyc_real_time_today_hourly": [{"hour": h["hour"], "usd_mwh": h["usd_mwh"]} for h in rt],
+            "note": "pass ZONES (bare placeholder) for the zones array"}
+
+
+def t_battery(state: dict) -> dict:
+    from grid import profile
+
+    p = profile.get_profile()
+    state["BATTERY"] = p
+    return {"battery": p, "note": "pass BATTERY (bare placeholder) for the battery object"}
+
+
+def _set_plan_state(state: dict, p: dict) -> None:
+    sched = [{k: h.get(k) for k in ("hour", "price", "charge_mw", "discharge_mw", "soc_pct")} for h in p.get("schedule") or []]
+    state.update(HOURS=sched, BIDS=p.get("bids") or [], CHECKS=p.get("checks") or [], BATTERY=p.get("battery") or {},
+                 PLAN={"plan_id": p.get("plan_id"), "date": p.get("date"), "profit_usd": p.get("profit_usd"),
+                       "baseline_profit_usd": p.get("baseline_profit_usd"), "schedule": sched, "status": p.get("status")})
+
+
+def t_latest_plan(state: dict) -> dict:
+    from grid import agent
+
+    p = agent.latest_plan()
+    if not p:  # first load: the direct optimizer (fast path), not the desk
+        for ev in agent.run_plan(None, speak=False):
+            if ev.get("kind") == "plan":
+                p = ev
+            elif ev.get("kind") == "error":
+                raise RuntimeError(ev.get("text"))
+    if not p:
+        raise RuntimeError("no plan")
+    _set_plan_state(state, p)
+    return {**agent.summary(p), "baseline_profit_usd": p.get("baseline_profit_usd"), "uplift_usd": p.get("uplift_usd"),
+            "checks": p.get("checks"), "bids_count": len(p.get("bids") or []), "explanation": p.get("explanation"),
+            "placeholders": "HOURS = schedule, BIDS = bids, CHECKS = checks, PLAN = plan object, BATTERY = battery"}
+
+
+def t_backtest30(state: dict, days: int = 30) -> dict:
+    from grid import api
+
+    r = api.get_backtest(days=max(1, min(int(days), 30)))
+    state["DAYS"] = [{"date": x["date"], "profit": x.get("optimal_profit"), "baseline": x.get("baseline_profit")} for x in r["days"]]
+    state["TOTALS"] = r["totals"]
+    return {"settled_on": "NYISO real-time (planned on day-ahead)", "totals": r["totals"],
+            "days": [{"date": x["date"], "optimal_profit": x.get("optimal_profit"), "baseline_profit": x.get("baseline_profit")}
+                     for x in r["days"]], "note": "pass DAYS and TOTALS (bare placeholders)"}
+
+
+def t_memory(state: dict, limit: int = 20) -> dict:
+    from grid.sponsors import memory
+
+    facts = [{"kind": f["kind"], "key": f["key"], "text": f["text"], "source": f["source"], "at": f["valid_from"],
+              "superseded": bool(f.get("superseded_by"))} for f in memory.recent(max(1, min(int(limit), 40)))]
+    state["FACTS"] = facts
+    return {"facts": facts, "changes_24h": memory.changes_since(24)[:10], "note": "pass FACTS (bare placeholder)"}
+
+
 _D = {"type": "string", "description": "YYYY-MM-DD; omit for tomorrow's day-ahead market"}
 TOOLS: dict[str, tuple[Any, str, dict]] = {
     "get_prices": (t_get_prices, "Hourly NYISO N.Y.C. day-ahead prices ($/MWh) for a date.", {"date": _D}),
@@ -174,10 +240,23 @@ TOOLS: dict[str, tuple[Any, str, dict]] = {
     "compare": (t_compare, "Simple clock rule (buy 1-5am, sell 5-9pm) vs the optimal plan for one date, on day-ahead prices.",
                 {"date": _D, "reserve_pct": {"type": "number"}, "cycles": {"type": "number"}}),
     "backtest": (t_backtest, "Last N days (ending yesterday): plan on day-ahead, settle on real-time; per-day profit of the "
-                             "optimal plan vs the simple rule, plus totals.", {"days": {"type": "integer", "description": "1-30, default 7"}}),
+                             "optimal plan vs the simple rule, plus totals. Use for short windows like last week.",
+                 {"days": {"type": "integer", "description": "1-30, default 7"}}),
+    "backtest_30": (t_backtest30, "Cached 30-day backtest (same data the dashboard shows). Use for 'last 30 days' / 'last month'.",
+                    {"days": {"type": "integer", "description": "default 30"}}),
+    "grid_now": (t_grid_now, "Live NYISO real-time prices right now for all 11 zones, plus N.Y.C. hourly real-time today.", {}),
+    "battery_profile": (t_battery, "The operator's current battery profile (size, efficiency, SOC, price rules, zone).", {}),
+    "latest_plan": (t_latest_plan, "The current plan for tomorrow (the one awaiting approval): profit, schedule, bids, "
+                                   "safety checks, plan_id. Use for 'tomorrow', 'how much will it make', 'bids', 'approve'.", {}),
+    "memory_facts": (t_memory, "Operator memory: recent facts (constraints, battery changes, approvals) and what changed in 24h.",
+                     {"limit": {"type": "integer", "description": "default 20"}}),
 }
 STATUS = {"get_prices": "reading NYISO day-ahead prices...", "plan": "optimizing the trading plan and simulating it...",
-          "compare": "comparing against the simple clock rule...", "backtest": "backtesting on real-time prices..."}
+          "compare": "comparing against the simple clock rule...", "backtest": "backtesting on real-time prices...",
+          "backtest_30": "loading the 30-day backtest...", "grid_now": "reading live NYISO zone prices...",
+          "battery_profile": "reading the battery profile...", "latest_plan": "loading tomorrow's plan...",
+          "memory_facts": "recalling memory..."}
+PLACEHOLDERS = ("HOURS", "BIDS", "ZONES", "DAYS", "TOTALS", "CHECKS", "FACTS", "PLAN", "BATTERY")
 
 
 def _tool_config() -> dict:
@@ -188,12 +267,14 @@ def _tool_config() -> dict:
 
 # ------------------------------------------------------------------ prompts
 
-PLAN_PROMPT = """You are the trader for a grid battery in New York City: 10 MW / 40 MWh, 85% round trip efficiency,
-SOC 10% to 90%, starts and ends the day at 50%, at most 1 full cycle per day, $8/MWh degradation, never charges and
-discharges in the same hour. It buys power when NYISO N.Y.C. prices are low and sells when high.
-Answer the operator's question by calling tools. For a what-if, call plan with the default constraints AND plan with
-the changed constraints so the difference can be shown. For "why not sell at X", call plan and get_prices.
-For "last week vs the simple rule", call backtest(7). Call 1 to 4 tools, then reply "done" (the UI is drawn next).
+PLAN_PROMPT = """You are the trader for a grid battery in New York City (default 10 MW / 40 MWh, 85% round trip, SOC 10%
+to 90%, starts and ends the day at 50%, at most 1 full cycle per day, $8/MWh degradation, never charges and discharges
+in the same hour; the operator's profile may differ, see battery_profile). It buys when NYISO prices are low and sells
+when high. Answer the operator by calling tools, then reply "done" (the UI is drawn next). Call 1 to 4 tools.
+Routing: tomorrow / how much will it make / bids / approve -> latest_plan. Grid now / prices right now / zones ->
+grid_now. Last 30 days / last month -> backtest_30. Last week vs the simple rule -> backtest(7). What changed /
+memory / history -> memory_facts. Battery settings -> battery_profile. What-if (reserve, half cycle, no selling
+before X) -> plan with the default constraints AND plan with the changed ones. "Why not sell at X" -> plan + get_prices.
 """
 
 RENDER_PROMPT = """You render the trader's answer as a generative UI. The tool results below are your ONLY source of
@@ -201,18 +282,25 @@ numbers: never invent, extrapolate or round wildly. Dollar amounts are USD, pric
 
 Streaming layout (REQUIRED): line 1 is `root = Stack([headline, ...])` using ONLY reference names; then define each
 referenced component on its OWN line in the same order. Never nest component calls inline inside root.
-Signatures (positional, in this order): ProfitHeadline(value, label, summary); BuySellChart(title, hours);
-SafetyChecks(items); Compare(title, rows); BacktestBars(title, days); Narrative(text); Evidence(text).
-Placeholders (bare words, never quoted, never typed out yourself): HOURS = the last plan's 24 hourly rows, use as
-BuySellChart("title", HOURS). DAYS = the backtest days, use as BacktestBars("title", DAYS). CHECKS = the last plan's
-safety checks, use as SafetyChecks(CHECKS).
-Typical answer: ProfitHeadline first; then BuySellChart (when a plan was made); Compare for what-if or baseline
-deltas (rows with label, value, unit "usd" | "pct" | "mwh" | "usd_mwh" | "cycles" | "hour"); BacktestBars for history;
-SafetyChecks when a plan was made; a one or two sentence Narrative; Evidence last (data source and where it was
-simulated, e.g. "NYISO N.Y.C. day-ahead, Oct 17; simulated in Daytona sandbox abc").
-Style: plain punctuation, never em dashes or en dashes. Hours as "3pm". Keep it compact: 4 to 7 blocks.
+Placeholders (bare words, never quoted, never typed out yourself; the server inserts the real data): HOURS (plan
+hourly rows), BIDS (day-ahead bids), ZONES (live zone prices), DAYS (backtest days), TOTALS (backtest totals),
+CHECKS (safety checks), FACTS (memory facts), PLAN (plan object), BATTERY (battery profile object).
+Pass them wherever a component takes that array/object, e.g. BuySellChart("title", HOURS), SafetyChecks(CHECKS).
+Which components (use the signatures from the component rules below):
+- tomorrow / how much will it make: ProfitHeadline, PlayTomorrow(HOURS, profit, BATTERY), BuySellChart, SafetyChecks, ApproveCard(plan_id, profit, message).
+- grid now: LivePrice, ZoneMap(ZONES).
+- bids: BidsTable(BIDS), ApproveCard.
+- last 30 days: BacktestCalendar(DAYS, TOTALS), Compare (optimal vs simple rule totals).
+- what changed / memory: MemoryTimeline(FACTS).
+- what-if or why questions: ProfitHeadline, Compare (default vs what-if), BuySellChart(HOURS), SafetyChecks(CHECKS), Narrative.
+- scale questions (bigger battery): ScaleSlider(PLAN, BATTERY).
+Add a one or two sentence Narrative when it helps. Only use components that exist in the rules below.
+Style: plain punctuation, never em dashes or en dashes. Hours as "3pm". Keep it compact: 3 to 6 blocks.
 Output ONLY the OpenUI Lang program: no prose, no markdown, no code fences.
 
+"""
+FALLBACK_SIGS = """Signatures (positional, in this order): ProfitHeadline(value, label, summary); BuySellChart(title, hours);
+SafetyChecks(items); Compare(title, rows); BacktestBars(title, days); Narrative(text); Evidence(text).
 """
 
 
@@ -283,7 +371,7 @@ class StatementParser:
 
 def _subst(line: str, state: dict) -> str:
     """Replace bare placeholders (HOURS, DAYS, CHECKS) outside strings with the server-held JSON arrays."""
-    keys = [k for k in ("HOURS", "DAYS", "CHECKS") if k in line]
+    keys = [k for k in PLACEHOLDERS if k in line and k in state]
     if not keys:
         return line
     out, i, quote = [], 0, None
@@ -360,7 +448,7 @@ def _run(q: str, system_prompt: str, emit) -> list[str]:
         parser, n = StatementParser(), 0
         with _ag("inference", MODEL_ID, group="bedrock", kind="llm"), _tracer.start_as_current_span(
                 f"llm {MODEL_ID} render", attributes={"openinference.span.kind": "LLM", "llm.model_name": MODEL_ID}):
-            r = c.converse_stream(modelId=MODEL_ID, system=[{"text": RENDER_PROMPT + (system_prompt or "") + ctx}],
+            r = c.converse_stream(modelId=MODEL_ID, system=[{"text": RENDER_PROMPT + (system_prompt or FALLBACK_SIGS) + ctx}],
                                   messages=[{"role": "user", "content": [{"text": user}]}],
                                   inferenceConfig={"maxTokens": 2500})
             for ev in r["stream"]:
@@ -415,9 +503,128 @@ class AskReq(BaseModel):
 
 
 @router.post("/api/ask")
-async def ask(req: AskReq):
+async def ask(req: AskReq, fast: bool = False):  # fast: latest_plan always uses the direct optimizer when no plan exists
     async def gen():
         async for ev in run_ask(req.q, req.system_prompt or ""):
+            yield f"data: {json.dumps(ev, default=str)}\n\n"
+
+    return StreamingResponse(gen(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+# ------------------------------------------------------------------ /api/command: approve | change rules | question
+
+_APPROVE = re.compile(r"^\s*(?:yes[,!. ]*)?(?:please\s+)?(?:approve|approved|go ahead|ship it)(?:\s+(?:it|this|that|the plan|the trade|tomorrow'?s plan))?\s*(?:please)?[.!]*\s*$", re.I)
+_QUESTION = re.compile(r"^\s*(why|how|what|when|which|who|should|could|would|is|are|does|do|did|can|will)\b", re.I)
+
+
+def _classify_llm(q: str) -> str:
+    try:
+        r = _converse(_client(), system=[{"text": "Label the operator's message to a battery trading desk. Reply with exactly "
+                                                     "one word: command (they want a rule, limit or battery setting changed and the "
+                                                     "plan redone) or question (they want information or a what-if answer)."}],
+                      messages=[{"role": "user", "content": [{"text": q}]}], inferenceConfig={"maxTokens": 50})
+        txt = "".join(b.get("text", "") for b in r["output"]["message"]["content"]).lower()
+        return "command" if "command" in txt else "question"
+    except Exception as e:  # noqa: BLE001
+        log.warning("command classify failed: %s", type(e).__name__)
+        return "question"
+
+
+def _fmt_changes(c: dict) -> str:
+    names = {"reserve_pct": ("reserve", "%"), "cycles": ("cycles", ""), "no_discharge_before": ("no selling before", ":00"),
+             "no_charge_after": ("no buying from", ":00"), "sell_above": ("sell above $", "/MWh"),
+             "buy_below": ("buy below $", "/MWh"), "start_soc_pct": ("starting charge", "%")}
+    out = []
+    if c and all(v is None for v in c.values()):
+        return "cleared all rules, back to the battery's defaults"
+    for k, v in c.items():
+        lab, unit = names.get(k, (k.replace("_", " "), ""))
+        if v is None:
+            out.append(f"cleared {lab.rstrip(' $')}")
+            continue
+        if isinstance(v, float) and v.is_integer():
+            v = int(v)
+        out.append(f"{lab}{v}{unit}" if lab.endswith("$") else f"{lab} {v}{unit}")
+    return ", ".join(out)
+
+
+async def run_command(q: str, system_prompt: str = "", fast: bool = False) -> AsyncIterator[dict]:
+    from grid import agent, profile
+
+    t0 = time.monotonic()
+    text = (q or "").strip()
+    if _APPROVE.match(text):
+        p = agent.latest_plan()
+        if not p:
+            yield {"kind": "error", "text": "no plan to approve yet"}
+        else:
+            r = await asyncio.to_thread(agent.approve, p["plan_id"], True, "command")
+            yield {"kind": "command", "applied": {"approve": r}, "text": f"Approved plan {r['plan_id']} for {r['date']}."}
+        yield {"kind": "done", "meta": {"ms": int((time.monotonic() - t0) * 1000), "route": "approve"}}
+        return
+
+    cons, prof = {}, {}
+    question = text.endswith("?") or bool(_QUESTION.match(text))
+    if not question:
+        cons = agent.parse_constraint(text) or {}
+        prof = profile.parse_note(text) or {}
+        if not cons and not prof and await asyncio.to_thread(_classify_llm, text) == "question":
+            question = True
+    if question:
+        async for ev in run_ask(text, system_prompt):
+            if ev["kind"] == "done":
+                ev.setdefault("meta", {})["route"] = "question"
+            yield ev
+        return
+
+    # command: apply, then re-plan through the same desk stream /api/replan uses
+    applied: dict = {}
+    if prof:
+        applied.update(await asyncio.to_thread(lambda: profile.save_profile(prof, source="command")["changed"]))
+    for k, v in cons.items():
+        await asyncio.to_thread(agent.add_constraint, k, v, text, "command")
+        applied[k] = v
+    summary = _fmt_changes(applied) if applied else f"note for the desk: {text}"
+    yield {"kind": "command", "applied": applied, "text": f"Applied: {summary}."}
+    plan = None
+    try:
+        async for ev in agent.desk_or_fast(None, text, fast=fast, speak=False):
+            if ev["kind"] == "plan":
+                plan = ev
+                yield ev
+            elif ev["kind"] in ("status", "error"):
+                yield ev
+    except Exception as e:  # noqa: BLE001
+        yield {"kind": "error", "text": f"{type(e).__name__}: {str(e)[:300]}"}
+    if plan:
+        where = (f"verified in Daytona sandbox {plan.get('sandbox_id')}" if plan.get("simulated_in") == "daytona"
+                 else "verified by local simulation")
+        profit = float(plan.get("profit_usd") or 0)
+        st: dict = {}
+        _set_plan_state(st, plan)
+        msg = plan.get("message") or f"New plan: ${profit:,.0f}. Approve?"
+        lines = [
+            ("root", "root = Stack([headline, note, chart, checks, approve])"),
+            ("headline", f"headline = ProfitHeadline({profit}, {json.dumps('new plan profit, ' + str(plan.get('date')))}, "
+                         f"{json.dumps(f'Applied: {summary}. Waiting for your approval.')})"),
+            ("note", f"note = Narrative({json.dumps(f'Applied: {summary}. New plan: ${profit:,.0f}, {where}.')})"),
+            ("chart", _subst(f"chart = BuySellChart({json.dumps('New plan for ' + str(plan.get('date')))}, HOURS)", st)),
+            ("checks", _subst("checks = SafetyChecks(CHECKS)", st)),
+            ("approve", f"approve = ApproveCard({json.dumps(plan.get('plan_id'))}, {profit}, {json.dumps(msg)})"),
+        ]
+        for sid, line in lines:
+            yield {"kind": "ui", "id": sid, "line": line}
+    else:
+        yield {"kind": "error", "text": "re-plan returned no plan"}
+    yield {"kind": "done", "meta": {"ms": int((time.monotonic() - t0) * 1000), "route": "command",
+                                    "plan_id": plan.get("plan_id") if plan else None}}
+
+
+@router.post("/api/command")
+async def command(req: AskReq, fast: bool = False):
+    async def gen():
+        async for ev in run_command(req.q, req.system_prompt or "", fast=fast):
             yield f"data: {json.dumps(ev, default=str)}\n\n"
 
     return StreamingResponse(gen(), media_type="text/event-stream",

@@ -1,30 +1,21 @@
 import "./nodevtools";
 import { Renderer } from "@openuidev/react-lang";
-import { useEffect, useMemo, useState } from "react";
-import { API } from "../api";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { API, MOCK, getBacktest, getJSON, streamPlan } from "../api";
+import { MicIcon, VoiceTranscript, useDispatcherVoice } from "../Voice";
 import { askPrompt, library } from "./library";
+import { backtestProgram, bidsProgram, gridProgram, memoryProgram, planProgram, playProgram, route, type Stmts } from "./programs";
 import "./ask.css";
 
-const EXAMPLES = [
-  "What if we keep 30% for the storm tomorrow?",
-  "Why not sell at 3pm?",
-  "How much did we make last week vs the simple rule?",
-  "What if the battery could only do half a cycle?",
-];
+const EXAMPLES = ["How much will my battery make tomorrow?", "Play tomorrow hour by hour", "Show the NY grid right now", "Keep 30% for the storm"];
 
-type Ev =
-  | { kind: "status"; text: string }
-  | { kind: "ui"; id: string; line: string }
-  | { kind: "error"; text: string }
-  | { kind: "done"; meta?: { ms?: number; tools?: string[] } };
+/* eslint-disable @typescript-eslint/no-explicit-any */
+type Ev = { kind: string; [k: string]: any };
+type Turn = { q: string; status: { text: string; err?: boolean }[]; stmts: Stmts; live: boolean; start: number; end?: number; tools?: string[] };
 
-type Turn = { q: string; status: { text: string; err?: boolean }[]; stmts: Record<string, string>; live: boolean; start: number; end?: number; tools?: string[] };
+const program = (s: Stmts) => [s.root, ...Object.entries(s).filter(([k]) => k !== "root").map(([, v]) => v)].filter(Boolean).join("\n");
 
-const program = (s: Record<string, string>) =>
-  [s.root, ...Object.entries(s).filter(([k]) => k !== "root").map(([, v]) => v)].filter(Boolean).join("\n");
-
-async function* sse(q: string, system_prompt: string): AsyncGenerator<Ev> {
-  const res = await fetch(`${API}/api/ask`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ q, system_prompt }) });
+async function* sse(res: Response): AsyncGenerator<Ev> {
   if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`);
   const reader = res.body.getReader();
   const dec = new TextDecoder();
@@ -37,9 +28,23 @@ async function* sse(q: string, system_prompt: string): AsyncGenerator<Ev> {
     while ((i = buf.indexOf("\n\n")) >= 0) {
       const data = buf.slice(0, i).split("\n").filter((l) => l.startsWith("data:")).map((l) => l.slice(5).trim()).join("\n");
       buf = buf.slice(i + 2);
-      if (data) yield JSON.parse(data) as Ev;
+      if (data) {
+        try {
+          yield JSON.parse(data) as Ev;
+        } catch {
+          /* skip */
+        }
+      }
     }
   }
+}
+
+async function ask(q: string, system_prompt: string): Promise<Response> {
+  const opts = { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ q, system_prompt }) };
+  // /api/command handles both commands and questions; fall back to /api/ask if it is not deployed.
+  const res = await fetch(`${API}/api/command`, opts);
+  if (res.status === 404 || res.status === 405) return fetch(`${API}/api/ask`, opts);
+  return res;
 }
 
 function Steps({ t }: { t: Turn }) {
@@ -51,15 +56,20 @@ function Steps({ t }: { t: Turn }) {
     return () => clearInterval(id);
   }, [t.live]);
   const secs = ((t.end ?? now) - t.start) / 1000;
-  const waiting = !t.stmts.root;
-  if (waiting)
+  if (!t.stmts.root)
     return (
       <div className="ask-loader">
         <ol>
-          {t.status.map((s, i) => {
-            const cur = t.live && i === t.status.length - 1 && !s.err;
-            return <li key={i} className={s.err ? "err" : cur ? "cur" : ""}><span className="ic">{s.err ? "!" : cur ? <i className="ask-spin" /> : "✓"}</span>{s.text}</li>;
+          {t.status.slice(-6).map((s, i, a) => {
+            const cur = t.live && i === a.length - 1 && !s.err;
+            return (
+              <li key={i} className={s.err ? "err" : cur ? "cur" : ""}>
+                <span className="ic">{s.err ? "!" : cur ? <i className="ask-spin" /> : "✓"}</span>
+                {s.text}
+              </li>
+            );
           })}
+          {!t.status.length && t.live && <li className="cur"><span className="ic"><i className="ask-spin" /></span>thinking</li>}
         </ol>
         <div className="ask-time mono">{secs.toFixed(1)}s</div>
       </div>
@@ -68,52 +78,165 @@ function Steps({ t }: { t: Turn }) {
   return (
     <div className="ask-steps">
       <button onClick={() => setOpen(!open)}>
-        {t.status.length} steps {"·"} {secs.toFixed(1)}s{t.live ? " · drawing" : ""} {open ? "▴" : "▾"}
+        {t.status.length} steps · {secs.toFixed(1)}s{t.live ? " · drawing" : ""} {open ? "▴" : "▾"}
       </button>
-      {open && <div className="ask-steplist">{t.status.map((s, i) => <div key={i} className={s.err ? "red" : ""}>{s.text}</div>)}{t.tools?.length ? <div>tools: {t.tools.join(", ")}</div> : null}</div>}
+      {open && (
+        <div className="ask-steplist">
+          {t.status.map((s, i) => <div key={i} className={s.err ? "red" : ""}>{s.text}</div>)}
+          {t.tools?.length ? <div>tools: {t.tools.join(", ")}</div> : null}
+        </div>
+      )}
       {!open && errs.map((s, i) => <div key={i} className="red">{s.text}</div>)}
     </div>
   );
 }
 
-export default function AskTrader() {
+export default function AskTrader({ battery, autoStart = true }: { battery: Record<string, unknown>; autoStart?: boolean }) {
   const [q, setQ] = useState("");
   const [turn, setTurn] = useState<Turn | null>(null);
   const busy = !!turn?.live;
   const prompt = useMemo(() => askPrompt(), []);
+  const lastPlan = useRef<any>(null);
+  const batRef = useRef(battery);
+  batRef.current = battery;
+
+  function begin(query: string) {
+    const t0: Turn = { q: query, status: [], stmts: {}, live: true, start: performance.now() };
+    setTurn(t0); // a new query replaces the old answer
+    const patch = (f: (t: Turn) => Turn) => setTurn((t) => (t && t.start === t0.start ? f(t) : t));
+    const say = (text: string, err = false) => patch((t) => ({ ...t, status: [...t.status, { text, err }] }));
+    const draw = (stmts: Stmts) => patch((t) => ({ ...t, stmts }));
+    const end = () => patch((t) => ({ ...t, live: false, end: t.end ?? performance.now() }));
+    return { patch, say, draw, end };
+  }
+
+  /** Instant answer from the optimizer fast path (no LLM). */
+  async function runFast(query = EXAMPLES[0]) {
+    const { say, draw, end } = begin(query);
+    try {
+      await streamPlan(
+        (e) => {
+          if (e.kind === "status" && e.text) say(String(e.text));
+          if (e.kind === "plan") {
+            lastPlan.current = e;
+            draw(planProgram(e));
+          }
+          if (e.kind === "error") say(String(e.text ?? "planner error"), true);
+        },
+        undefined,
+        true,
+      );
+    } catch (err) {
+      say(`API unreachable at ${API}: ${String(err)}`, true);
+    }
+    end();
+  }
+
+  /** Client-side answer (mock mode, or when the API cannot answer). */
+  async function runLocal(query: string, h: ReturnType<typeof begin>) {
+    const kind = route(query);
+    if (kind === "grid") return h.draw(gridProgram());
+    if (kind === "memory") return h.draw(memoryProgram());
+    if (kind === "backtest") {
+      h.say("reading 30 days of backtest results");
+      const bt = await getBacktest();
+      return bt ? h.draw(backtestProgram(bt)) : h.say("backtest unavailable", true);
+    }
+    if (!lastPlan.current) {
+      h.say("optimizing tomorrow's plan");
+      await streamPlan((e) => e.kind === "plan" && (lastPlan.current = e), undefined, true);
+    }
+    const p = lastPlan.current;
+    if (!p) return h.say("no plan available", true);
+    if (kind === "play") return h.draw(playProgram(p, batRef.current));
+    if (kind === "bids") return h.draw(bidsProgram(p));
+    return h.draw(planProgram(p));
+  }
 
   async function run(text: string) {
     const query = text.trim();
     if (!query || busy) return;
     setQ("");
-    const t0: Turn = { q: query, status: [], stmts: {}, live: true, start: performance.now() };
-    setTurn(t0); // a new question replaces the old answer
-    const patch = (f: (t: Turn) => Turn) => setTurn((t) => (t && t.start === t0.start ? f(t) : t));
-    try {
-      for await (const ev of sse(query, prompt)) {
-        if (ev.kind === "status") patch((t) => ({ ...t, status: [...t.status, { text: ev.text }] }));
-        else if (ev.kind === "ui") patch((t) => ({ ...t, stmts: { ...t.stmts, [ev.id]: ev.line } }));
-        else if (ev.kind === "error") patch((t) => ({ ...t, status: [...t.status, { text: ev.text, err: true }] }));
-        else if (ev.kind === "done") patch((t) => ({ ...t, live: false, tools: ev.meta?.tools, end: performance.now() }));
+    const h = begin(query);
+    if (MOCK) {
+      for (const s of ["reading the question", "reading NYISO prices", "simulating in a Daytona sandbox"]) {
+        h.say(s);
+        await new Promise((r) => setTimeout(r, 250));
       }
-    } catch (e) {
-      patch((t) => ({ ...t, status: [...t.status, { text: `API unreachable at ${API}: ${String(e)}`, err: true }] }));
+      await runLocal(query, h);
+      return h.end();
     }
-    patch((t) => ({ ...t, live: false, end: t.end ?? performance.now() }));
+    let drew = false;
+    let gotPlan: any = null;
+    try {
+      for await (const ev of sse(await ask(query, prompt))) {
+        if (ev.kind === "status") h.say(String(ev.text));
+        else if (ev.kind === "ui") {
+          drew = true;
+          h.patch((t) => ({ ...t, stmts: { ...t.stmts, [ev.id]: ev.line } }));
+        } else if (ev.kind === "plan") {
+          gotPlan = ev;
+          lastPlan.current = ev;
+        } else if (ev.kind === "command") h.say(`${ev.applied ? "Applied" : "Not applied"}: ${ev.text ?? ""}`);
+        else if (ev.kind === "error") h.say(String(ev.text), true);
+        else if (ev.kind === "done") h.patch((t) => ({ ...t, tools: ev.meta?.tools }));
+      }
+      if (!drew && gotPlan) h.draw(planProgram(gotPlan));
+    } catch (e) {
+      h.say(`The trader could not answer (${String(e)}); showing the optimizer's answer.`, true);
+      await runLocal(query, h).catch(() => undefined);
+    }
+    h.end();
   }
 
+  async function showPlan(planId: string | undefined, why: "replan" | "approve") {
+    const h = begin(why === "approve" ? "Approved by voice" : "Re-planned by voice");
+    try {
+      const p = planId ? await getJSON(`/api/plan/${planId}`) : await getJSON("/api/plan/latest");
+      lastPlan.current = p;
+      h.draw(planProgram(p, why === "approve" ? "approved profit tomorrow" : "new profit tomorrow"));
+    } catch (e) {
+      h.say(String(e), true);
+    }
+    h.end();
+  }
+
+  const voice = useDispatcherVoice({ onPlanChanged: showPlan });
+
+  // first load: instant answer; other parts of the page can trigger queries / re-plans
+  const started = useRef(false);
+  useEffect(() => {
+    if (autoStart && !started.current) {
+      started.current = true;
+      runFast();
+    }
+    const onAsk = (e: Event) => run(String((e as CustomEvent).detail ?? ""));
+    const onReplan = () => runFast("How much will my battery make tomorrow?");
+    window.addEventListener("grid:ask", onAsk);
+    window.addEventListener("grid:replan", onReplan);
+    return () => {
+      window.removeEventListener("grid:ask", onAsk);
+      window.removeEventListener("grid:replan", onReplan);
+    };
+  });
+
   return (
-    <section className="ask">
-      <div className="rule"><span>Ask the trader</span></div>
+    <section className="ask ask-top">
       <form className="ask-search" onSubmit={(e) => { e.preventDefault(); run(q); }}>
-        <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="Ask the trader..." />
-        <button className="go" disabled={busy || !q.trim()}>{busy ? "thinking" : "Ask"}</button>
+        <input value={q} onChange={(e) => setQ(e.target.value)} placeholder={window.innerWidth < 640 ? "Ask, or give a command" : "Ask or command: keep 30% for the storm, only sell above $60, approve"} aria-label="Ask the trader" />
+        <button type="button" className={`mic ${voice.state}`} onClick={voice.toggle} aria-label={voice.live ? "End voice" : "Talk to the trader"} title={voice.live ? "End voice" : "Talk to the trader"}>
+          <MicIcon />
+        </button>
+        <button className="go" disabled={busy || !q.trim()}>{busy ? "···" : "Ask"}</button>
       </form>
+      <VoiceTranscript v={voice} />
       <div className="ask-chips">
-        {EXAMPLES.map((x) => <button key={x} className="ask-chip" disabled={busy} onClick={() => run(x)}>{x}</button>)}
+        {EXAMPLES.map((x) => (
+          <button key={x} className="ask-chip" disabled={busy} onClick={() => run(x)}>{x}</button>
+        ))}
       </div>
       {turn && (
-        <article className="ask-turn">
+        <article className="ask-turn" key={turn.start}>
           <h2 className="ask-q">{turn.q}</h2>
           <Steps t={turn} />
           {turn.stmts.root && <Renderer response={program(turn.stmts)} library={library} isStreaming={turn.live} />}

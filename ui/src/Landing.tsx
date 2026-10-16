@@ -166,7 +166,7 @@ export function ZoneMap({ live }: { live: Live | null }) {
 
 /* ------------------------------------------------------------------ play tomorrow */
 
-export function PlayTomorrow({ plan }: { plan: Plan }) {
+export function PlayTomorrow({ plan, showSold = true }: { plan: Plan; showSold?: boolean }) {
   const rows = plan.rows;
   const [h, setH] = useState(rows.length); // hours elapsed (0..24)
   const [playing, setPlaying] = useState(false);
@@ -208,7 +208,7 @@ export function PlayTomorrow({ plan }: { plan: Plan }) {
         <input className="scrub" type="range" min={0} max={rows.length} step={1} value={h} onChange={(e) => { setPlaying(false); setH(+e.target.value); }} />
         <span className="mono clock">{h === 0 ? "start of day" : `${hourLabel(rows[h - 1].hour)} to ${hourLabel(rows[h - 1].hour + 1)}`}</span>
       </div>
-      <div className="play-body">
+      <div className={`play-body ${showSold ? "" : "two"}`}>
         <div className={`battery ${mode}`}>
           <div className="cap" />
           <div className="shell">
@@ -227,7 +227,7 @@ export function PlayTomorrow({ plan }: { plan: Plan }) {
           <div className="row total"><span>Running profit</span><b className="mono">{fmtUsd(profit)}</b></div>
           {h >= rows.length && <p className="fine">Ends at the plan's {fmtUsd(plan.profit_usd)}.</p>}
         </div>
-        <div className="sold">
+        {showSold && <div className="sold">
           <span className="kicker">Who you sold to</span>
           {mode === "sell" ? (
             <>
@@ -242,7 +242,7 @@ export function PlayTomorrow({ plan }: { plan: Plan }) {
           )}
           <span className="mono delivered">{delivered.toFixed(1)} of {totalOut.toFixed(1)} MWh delivered when prices peaked</span>
           <span className="fine">Assumes {HOME_KW} kW average NYC home load.</span>
-        </div>
+        </div>}
       </div>
     </section>
   );

@@ -56,8 +56,9 @@ export function BatteryPanel({
         <label>Power MW<input type="number" step="0.1" min="0.1" {...num("power_mw")} /></label>
         <label>Storage MWh<input type="number" step="0.1" min="0.1" {...num("energy_mwh")} /></label>
         <label>
-          Stored now{" "}
-          <button className="unit-toggle" onClick={() => setStoredPct((x) => !x)}>{storedPct ? "%" : "MWh"}</button>
+          <span>
+            Stored now <button className="unit-toggle" onClick={() => setStoredPct((x) => !x)}>in {storedPct ? "%" : "MWh"}</button>
+          </span>
           {storedPct ? (
             <input type="number" min="0" max="100" value={Math.round((f.stored_mwh / f.energy_mwh) * 100)} onChange={(e) => set("stored_mwh", (+e.target.value / 100) * f.energy_mwh)} />
           ) : (
