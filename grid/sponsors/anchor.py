@@ -97,8 +97,8 @@ def cleanup_stale(max_age_s: float = 300) -> int:
     return n
 
 
-def _browse(box: dict) -> None:
-    """Worker: create a short-lived session, render the dashboard, record the session id so the caller can delete it."""
+def _browse(box: dict, url: str = DASHBOARD, fmt: str = "html") -> None:
+    """Worker: create a short-lived session, render `url`, record the session id so the caller can delete it."""
     try:
         r = httpx.post(f"{API}/v1/sessions", headers=_h(), timeout=20,
                        json={"session": {"timeout": {"max_duration": 2, "idle_timeout": 1}}})
@@ -109,7 +109,7 @@ def _browse(box: dict) -> None:
         if box.get("abandoned"):
             return
         r2 = httpx.post(f"{API}/v1/tools/fetch-webpage", params={"sessionId": box["sid"]}, headers=_h(), timeout=30,
-                        json={"url": DASHBOARD, "format": "html"})
+                        json={"url": url, "format": fmt})
         r2.raise_for_status()
         box["html"] = r2.text
     except Exception as e:  # noqa: BLE001
@@ -175,3 +175,26 @@ def cross_check_price(timeout: float = 15.0) -> dict | None:
         return row
     finally:
         _check_lock.release()
+
+
+def render_page(url: str, fmt: str = "html", timeout: float = 25.0) -> tuple[str | None, str | None]:
+    """Render one public page in a short-lived Anchor session (always deleted, also on timeout).
+    Returns (text, None) or (None, error). Caller is responsible for its own locking/caching."""
+    if not enabled():
+        return None, "anchor disabled"
+    box: dict = {}
+    th = threading.Thread(target=_browse, args=(box, url, fmt), daemon=True)
+    th.start()
+    th.join(timeout)
+    if th.is_alive():
+        box["abandoned"] = True
+        if box.get("sid") and not box.get("deleted"):
+            box["deleted"] = True
+            _delete(box["sid"])
+        _state["error"] = f"timeout after {timeout:g}s"
+        return None, _state["error"]
+    if box.get("error") or not box.get("html"):
+        _state["error"] = box.get("error") or "empty page"
+        return None, _state["error"]
+    _state.update(error=None, last={"url": url, "chars": len(box["html"])})
+    return box["html"], None

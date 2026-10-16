@@ -188,8 +188,51 @@ const Evidence = defineComponent({
   component: ({ props }) => <div className="ask-evidence">{props.text}</div>,
 });
 
+const GridAlerts = defineComponent({
+  name: "GridAlerts",
+  description:
+    "NYISO grid operating status and active alerts. status: normal | alert | emergency. alerts: [{type, zone, text, since, simulated}] (simulated true marks a demo alert). Read live from NYISO in a cloud browser (Anchor).",
+  props: z.object({
+    status: z.string(),
+    alerts: z
+      .array(z.object({ type: z.string().nullable().optional(), zone: z.string().nullable().optional(), text: z.string(), since: z.string().nullable().optional(), simulated: z.boolean().nullable().optional() }))
+      .nullable()
+      .optional(),
+  }),
+  component: ({ props }) => {
+    const st = String(props.status || "normal").toLowerCase();
+    const level = /emerg/.test(st) ? "emergency" : /alert|warn|watch/.test(st) ? "alert" : "normal";
+    const color = level === "emergency" ? RED : level === "alert" ? GOLD : GREEN;
+    const items = arr(props.alerts);
+    return (
+      <Card className="wide" tag="grid alerts">
+        <div className="ga-status">
+          <i style={{ background: color, boxShadow: `0 0 10px ${color}` }} />
+          <span style={{ color }}>{level === "normal" ? "Normal operations" : level === "alert" ? "Alert" : "Emergency"}</span>
+          {!items.length && <span className="dim">no active alerts</span>}
+        </div>
+        {items.length > 0 && (
+          <ul className="ga-list">
+            {items.map((a, i) => (
+              <li key={i}>
+                <span className="mono ga-type">{[a.type, a.zone].filter(Boolean).join(" · ")}</span>
+                <span>
+                  {a.text}
+                  {a.simulated && <em className="ga-sim">simulated for demo</em>}
+                </span>
+                <span className="mono ga-since">{a.since ?? ""}</span>
+              </li>
+            ))}
+          </ul>
+        )}
+        <div className="ask-fine">read live from NYISO in a cloud browser (Anchor)</div>
+      </Card>
+    );
+  },
+});
+
 export const library = createLibrary({
-  components: [Stack, ProfitHeadline, BuySellChart, Compare, BacktestBars, SafetyChecks, Narrative, Evidence, ...pageComponents],
+  components: [Stack, ProfitHeadline, BuySellChart, Compare, BacktestBars, SafetyChecks, Narrative, Evidence, GridAlerts, ...pageComponents],
   root: "Stack",
 });
 

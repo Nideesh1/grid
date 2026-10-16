@@ -361,6 +361,15 @@ def run_plan(d=None, constraint_overrides: dict | None = None, prompt_version: s
                 cons = {**active_constraints(), **(constraint_overrides or {})}
                 changed = [c for c in memory.changes_since(24) if not c.startswith("price_forecast")][:4]
                 _set_output(sp, {"constraints": cons, "changes": changed})
+            try:  # grid alerts via Anchor (grid/alerts.py): same 30% reserve rule as the desk risk-officer
+                from grid import alerts as _alerts
+
+                need, why = _alerts.required_reserve(zone)
+                if need and float(cons.get("reserve_pct") or 0) < need:
+                    cons = {**cons, "reserve_pct": need}
+                    yield {"kind": "status", "text": f"risk-officer: {why}, raising reserve to {need:g}%"}
+            except Exception as e:  # noqa: BLE001
+                log.warning("grid alerts skipped: %s", type(e).__name__)
             request = {"trading_day": day.isoformat(), "zone": zone, "battery": bat_in, "price_rules": prules, "constraints": cons,
                        "prompt_version": prompt_version}
             root.set_attribute("input.value", json.dumps(request))
@@ -389,6 +398,9 @@ def run_plan(d=None, constraint_overrides: dict | None = None, prompt_version: s
                 v = sim["violations"]
                 checks = _checks(sim, cons, opt["battery"], ver["where"], ver["sandbox_id"])
                 row = anchor_get(8.0) if anchor_get else None
+                from grid import alerts as _alerts  # grid alerts: PASS if min SOC keeps the alert reserve
+
+                row = _alerts.grade_row(row, sim)
                 if row:
                     checks.append(row)
                 _set_output(sp, checks)
@@ -536,7 +548,7 @@ def backtest_fanout(days: int = 30, on_progress=None, conc: int = 8) -> dict:
 
 # ------------------------------------------------------------------ Anchor (non-blocking) + deepagents desk adapter
 def start_anchor():
-    """Kick off the Anchor live-browser price cross-check in a thread; returns get(timeout) -> check row | None."""
+    """Kick off the Anchor live-browser grid-alerts check in a thread; returns get(timeout) -> check row | None."""
     box: dict = {}
     if not anchor.enabled():
         return lambda timeout=0: None
@@ -549,8 +561,10 @@ def start_anchor():
     def _run():
         tok = otel_ctx.attach(ctx)
         try:
-            with _tool("anchor_cross_check", {"source": "NYISO real-time dashboard in Anchor cloud browser"}):
-                box["row"] = anchor.cross_check_price()
+            with _tool("anchor_grid_alerts", {"source": "NYISO System Conditions page in Anchor cloud browser"}):
+                from grid import alerts  # grid alerts via Anchor (replaces the old price cross-check row)
+
+                box["row"] = alerts.check_row()
         finally:
             otel_ctx.detach(tok)
 
@@ -603,6 +617,9 @@ def plan_from_desk(result: dict, anchor_get=None, speak: bool = True) -> dict:
     checks.append({"name": f"risk officer verdict: {result['verdict']}", "ok": result["verdict"] == "approve",
                    "detail": ((result.get("verdict_detail") or {}).get("reason") or "")[:160]})
     row = anchor_get(8.0) if anchor_get else None
+    from grid import alerts as _alerts  # grid alerts: PASS if min SOC keeps the alert reserve
+
+    row = _alerts.grade_row(row, sim)
     if row:
         checks.append(row)
     buy, sell = _windows(opt["hours"], "charge_mw"), _windows(opt["hours"], "discharge_mw")

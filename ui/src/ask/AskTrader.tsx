@@ -7,7 +7,7 @@ import { askPrompt, library } from "./library";
 import { backtestProgram, bidsProgram, gridProgram, memoryProgram, planProgram, playProgram, route, type Stmts } from "./programs";
 import "./ask.css";
 
-const EXAMPLES = ["How much will my battery make tomorrow?", "Play tomorrow hour by hour", "Show the NY grid right now", "Keep 30% for the storm"];
+const EXAMPLES = ["How much will my battery make tomorrow?", "Any grid alerts right now?", "Show the NY grid right now", "Keep 30% for the storm"];
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 type Ev = { kind: string; [k: string]: any };

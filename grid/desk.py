@@ -142,6 +142,15 @@ def _rules() -> dict:
         texts.append(f"(today's operator note) {note}")
         for k, v in (_parse(note) or {}).items():
             req[k] = _tighter(k, req.get(k), v)
+    ga = _state().get("grid_alerts")  # grid alerts (grid/alerts.py): NYISO alert/emergency -> reserve >= 30%
+    if ga:
+        from grid import alerts as _alerts
+
+        hits = _alerts.affecting(ga, _bat().get("zone"))
+        if hits:
+            req["reserve_pct"] = _tighter("reserve_pct", req.get("reserve_pct"), _alerts.ALERT_RESERVE_PCT)
+            texts.append(f"{_alerts.describe(hits[0])}: keep at least {_alerts.ALERT_RESERVE_PCT:g}% reserve "
+                         "for the evening peak")
     notes = []
     from grid.optimize import _battery_dict
 
@@ -500,7 +509,7 @@ def _result(st: dict, messages: list, t0: float) -> dict:
     steps.append({"agent": "desk-lead", "summary": " ".join(str(lead).split())[:300]})
     return {"message": msg, "plan": plan, "battery": battery_line(), "simulation": sim, "verdict": verdict,
             "verdict_detail": final, "verdicts": st["verdicts"], "steps": steps, "date": st["date"],
-            "operator_note": st["note"], "elapsed_s": round(time.time() - t0, 2)}
+            "operator_note": st["note"], "grid_alerts": st.get("grid_alerts"), "elapsed_s": round(time.time() - t0, 2)}
 
 
 def _prompt(day: str, note: str | None, brief: str = "") -> str:
@@ -523,6 +532,21 @@ async def stream_desk(date: str | None = None, operator_note: str | None = None)
         brief = await asyncio.to_thread(contextvars.copy_context().run, market_brief, day)
         st["brief"] = brief
         yield {"kind": "status", "agent": "market-analyst", "text": f"market-analyst: {brief}"}
+        # grid alerts (grid/alerts.py, via Anchor): risk-officer raises the reserve if NYISO alerts touch N.Y.C./our zone
+        try:
+            from grid import alerts as _alerts
+
+            ga = await asyncio.to_thread(_alerts.get_grid_alerts)
+            st["grid_alerts"] = ga
+            hits = _alerts.affecting(ga, _bat().get("zone"))
+            if hits:
+                yield {"kind": "status", "agent": "risk-officer", "text": f"risk-officer: {_alerts.describe(hits[0])}, "
+                       f"raising reserve to {_alerts.ALERT_RESERVE_PCT:g}%"}
+            else:
+                yield {"kind": "status", "agent": "risk-officer", "text": "risk-officer: NYISO grid alerts "
+                       + ("unavailable" if ga["via"] == "unavailable" else f"{ga['status']} (via Anchor)")}
+        except Exception as e:  # noqa: BLE001
+            log.warning("grid alerts failed: %s", type(e).__name__)
         prompt = _prompt(day, operator_note, brief)
         try:
             import agentglow

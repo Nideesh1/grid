@@ -328,7 +328,7 @@ def get_memory_ask(q: str = "what changed since last night?"):
 
 
 # ---- extra routers (other tracks mount here, e.g. grid/ask.py: `router = APIRouter()`)
-for _mod in ("grid.ask", "grid.runs"):
+for _mod in ("grid.ask", "grid.runs", "grid.alerts_api"):  # grid.alerts_api: grid alerts via Anchor
     try:
         import importlib
 

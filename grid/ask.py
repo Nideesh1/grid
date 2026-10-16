@@ -228,6 +228,14 @@ def t_memory(state: dict, limit: int = 20) -> dict:
     return {"facts": facts, "changes_24h": memory.changes_since(24)[:10], "note": "pass FACTS (bare placeholder)"}
 
 
+def t_grid_alerts(state: dict) -> dict:  # grid alerts via Anchor (grid/alerts.py)
+    from grid import alerts
+
+    r = alerts.get_grid_alerts()
+    state["ALERTS"] = r.get("alerts") or []
+    return {**r, "note": "render GridAlerts(status, ALERTS); if simulated is true, say 'simulated for demo'"}
+
+
 _D = {"type": "string", "description": "YYYY-MM-DD; omit for tomorrow's day-ahead market"}
 TOOLS: dict[str, tuple[Any, str, dict]] = {
     "get_prices": (t_get_prices, "Hourly NYISO N.Y.C. day-ahead prices ($/MWh) for a date.", {"date": _D}),
@@ -248,6 +256,8 @@ TOOLS: dict[str, tuple[Any, str, dict]] = {
     "battery_profile": (t_battery, "The operator's current battery profile (size, efficiency, SOC, price rules, zone).", {}),
     "latest_plan": (t_latest_plan, "The current plan for tomorrow (the one awaiting approval): profit, schedule, bids, "
                                    "safety checks, plan_id. Use for 'tomorrow', 'how much will it make', 'bids', 'approve'.", {}),
+    "get_grid_alerts": (t_grid_alerts, "NYISO grid alerts right now (System Conditions page read in a live Anchor browser): "
+                                       "normal/alert/emergency, Thunderstorm Alert, Reserve Pick-up. Use for 'any grid alerts?'.", {}),
     "memory_facts": (t_memory, "Operator memory: recent facts (constraints, battery changes, approvals) and what changed in 24h.",
                      {"limit": {"type": "integer", "description": "default 20"}}),
 }
@@ -255,8 +265,8 @@ STATUS = {"get_prices": "reading NYISO day-ahead prices...", "plan": "optimizing
           "compare": "comparing against the simple clock rule...", "backtest": "backtesting on real-time prices...",
           "backtest_30": "loading the 30-day backtest...", "grid_now": "reading live NYISO zone prices...",
           "battery_profile": "reading the battery profile...", "latest_plan": "loading tomorrow's plan...",
-          "memory_facts": "recalling memory..."}
-PLACEHOLDERS = ("HOURS", "BIDS", "ZONES", "DAYS", "TOTALS", "CHECKS", "FACTS", "PLAN", "BATTERY")
+          "memory_facts": "recalling memory...", "get_grid_alerts": "checking NYISO grid alerts in a live browser (Anchor)..."}
+PLACEHOLDERS = ("HOURS", "BIDS", "ZONES", "DAYS", "TOTALS", "CHECKS", "FACTS", "PLAN", "BATTERY", "ALERTS")
 
 
 def _tool_config() -> dict:
@@ -273,7 +283,7 @@ in the same hour; the operator's profile may differ, see battery_profile). It bu
 when high. Answer the operator by calling tools, then reply "done" (the UI is drawn next). Call 1 to 4 tools.
 Routing: tomorrow / how much will it make / bids / approve -> latest_plan. Grid now / prices right now / zones ->
 grid_now. Last 30 days / last month -> backtest_30. Last week vs the simple rule -> backtest(7). What changed /
-memory / history -> memory_facts. Battery settings -> battery_profile. What-if (reserve, half cycle, no selling
+memory / history -> memory_facts. Battery settings -> battery_profile. Grid alerts / storms / emergencies -> get_grid_alerts. What-if (reserve, half cycle, no selling
 before X) -> plan with the default constraints AND plan with the changed ones. "Why not sell at X" -> plan + get_prices.
 """
 
@@ -284,7 +294,7 @@ Streaming layout (REQUIRED): line 1 is `root = Stack([headline, ...])` using ONL
 referenced component on its OWN line in the same order. Never nest component calls inline inside root.
 Placeholders (bare words, never quoted, never typed out yourself; the server inserts the real data): HOURS (plan
 hourly rows), BIDS (day-ahead bids), ZONES (live zone prices), DAYS (backtest days), TOTALS (backtest totals),
-CHECKS (safety checks), FACTS (memory facts), PLAN (plan object), BATTERY (battery profile object).
+CHECKS (safety checks), FACTS (memory facts), PLAN (plan object), BATTERY (battery profile object), ALERTS (grid alerts).
 Pass them wherever a component takes that array/object, e.g. BuySellChart("title", HOURS), SafetyChecks(CHECKS).
 Which components (use the signatures from the component rules below):
 - tomorrow / how much will it make: ProfitHeadline, PlayTomorrow(HOURS, profit, BATTERY), BuySellChart, SafetyChecks, ApproveCard(plan_id, profit, message).
@@ -292,6 +302,7 @@ Which components (use the signatures from the component rules below):
 - bids: BidsTable(BIDS), ApproveCard.
 - last 30 days: BacktestCalendar(DAYS, TOTALS), Compare (optimal vs simple rule totals).
 - what changed / memory: MemoryTimeline(FACTS).
+- grid alerts: GridAlerts(status, ALERTS) with status "normal"|"alert"|"emergency"; if simulated, Narrative says "simulated for demo".
 - what-if or why questions: ProfitHeadline, Compare (default vs what-if), BuySellChart(HOURS), SafetyChecks(CHECKS), Narrative.
 - scale questions (bigger battery): ScaleSlider(PLAN, BATTERY).
 Add a one or two sentence Narrative when it helps. Only use components that exist in the rules below.
@@ -549,6 +560,21 @@ def _fmt_changes(c: dict) -> str:
     return ", ".join(out)
 
 
+_DEMO_ON = re.compile(r"\b(simulate|simulated|demo|trigger|fake)\b.*\b(thunderstorm|storm|emergency)\b", re.I)
+_DEMO_OFF = re.compile(r"\b(clear|end|stop|cancel|remove|turn off)\b.*\b(alert|simulation|storm|emergency|demo)\b", re.I)
+
+
+def _demo_cmd(text: str) -> str | None:
+    """'simulate a thunderstorm alert' -> 'thunderstorm'; 'simulate grid emergency' -> 'emergency'; 'clear the alert' /
+    'end simulation' -> '' (off); anything else -> None."""
+    if _DEMO_OFF.search(text):
+        return ""
+    m = _DEMO_ON.search(text)
+    if m:
+        return "emergency" if "emergenc" in m.group(2).lower() else "thunderstorm"
+    return None
+
+
 async def run_command(q: str, system_prompt: str = "", fast: bool = False) -> AsyncIterator[dict]:
     from grid import agent, profile
 
@@ -565,8 +591,9 @@ async def run_command(q: str, system_prompt: str = "", fast: bool = False) -> As
         return
 
     cons, prof = {}, {}
-    question = text.endswith("?") or bool(_QUESTION.match(text))
-    if not question:
+    demo = _demo_cmd(text)  # stage control: simulated grid alert on/off (grid/alerts.py), then re-plan
+    question = demo is None and (text.endswith("?") or bool(_QUESTION.match(text)))
+    if not question and demo is None:
         cons = agent.parse_constraint(text) or {}
         prof = profile.parse_note(text) or {}
         if not cons and not prof and await asyncio.to_thread(_classify_llm, text) == "question":
@@ -580,16 +607,22 @@ async def run_command(q: str, system_prompt: str = "", fast: bool = False) -> As
 
     # command: apply, then re-plan through the same desk stream /api/replan uses
     applied: dict = {}
+    if demo is not None:
+        from grid import alerts
+
+        (alerts.set_demo(demo) if demo else alerts.clear_demo())
+        applied["grid_alert_demo"] = demo or None
     if prof:
         applied.update(await asyncio.to_thread(lambda: profile.save_profile(prof, source="command")["changed"]))
     for k, v in cons.items():
         await asyncio.to_thread(agent.add_constraint, k, v, text, "command")
         applied[k] = v
-    summary = _fmt_changes(applied) if applied else f"note for the desk: {text}"
+    summary = ((f"simulated {demo} grid alert ON (simulated for demo)" if demo else "simulated grid alert cleared")
+               if demo is not None else _fmt_changes(applied) if applied else f"note for the desk: {text}")
     yield {"kind": "command", "applied": applied, "text": f"Applied: {summary}."}
     plan = None
     try:
-        async for ev in agent.desk_or_fast(None, text, fast=fast, speak=False):
+        async for ev in agent.desk_or_fast(None, None if demo is not None else text, fast=fast, speak=False):
             if ev["kind"] == "plan":
                 plan = ev
                 yield ev
