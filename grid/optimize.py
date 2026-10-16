@@ -289,3 +289,211 @@ def backtest(days: int = 30, mode: str = "rt", cap_kw: float | None = None, end=
             "pct": round(100 * (tot_b - tot_o) / tot_b, 1) if tot_b else 0.0,
         },
     }
+
+
+# =====================================================================================================
+# Grid battery arbitrage (PIVOT). Self-contained like the depot code: plans embed the battery params, so
+# arb_simulate(plan, prices) needs nothing but this file in a Daytona sandbox.
+# Plan shape: {kind, date, battery:{...}, constraints:{...}, hours:[{hour, ts, price, charge_mw, discharge_mw,
+#              soc_pct}], status, expected_profit_usd}
+# MW over one hour == MWh. charge_mw / discharge_mw are grid-side (AC) power.
+# =====================================================================================================
+
+_ARB_DEFAULT = {"power_mw": 10.0, "energy_mwh": 40.0, "rte": 0.85, "soc_min_pct": 10.0, "soc_max_pct": 90.0,
+                "start_soc_pct": 50.0, "end_soc_pct": 50.0, "max_cycles": 1.0, "degradation_usd_mwh": 8.0}
+
+
+def _battery_dict(battery=None) -> dict:
+    if battery is None:
+        try:
+            from grid.battery import DEFAULT
+            return DEFAULT.to_dict()
+        except ImportError:  # pragma: no cover
+            return dict(_ARB_DEFAULT)
+    return battery if isinstance(battery, dict) else battery.to_dict()
+
+
+def hourly_prices(prices: list[dict]) -> list[dict]:
+    """Average any-resolution [{ts, usd_mwh}] into hour-beginning rows [{ts, hour, usd_mwh}], sorted.
+    Real-time rows are interval-ending (00:05 belongs to hour 00); pass them as-is from grid.prices.real_time()."""
+    buckets: dict[datetime, list[float]] = {}
+    stamps = [datetime.fromisoformat(p["ts"]) for p in prices]
+    sub_hourly = any(t.minute or t.second for t in stamps)  # real-time 5-min, interval-ending
+    for p, ts in zip(prices, stamps):
+        if sub_hourly:
+            ts -= timedelta(minutes=5)  # 01:00 ends the 00:55 interval -> hour 00
+        h = ts.replace(minute=0, second=0, microsecond=0)
+        buckets.setdefault(h, []).append(float(p["usd_mwh"]))
+    return [{"ts": h.isoformat(), "hour": h.hour, "usd_mwh": round(float(np.mean(v)), 2)}
+            for h, v in sorted(buckets.items())]
+
+
+def _arb_plan(kind, hp, bat, cons, ch, dis, status) -> dict:
+    eta, E = bat["rte"] ** 0.5, bat["energy_mwh"]
+    soc = bat["start_soc_pct"] / 100 * E
+    hours = []
+    for i, p in enumerate(hp):
+        soc += ch[i] * eta - dis[i] / eta
+        hours.append({"hour": p["hour"], "ts": p["ts"], "price": p["usd_mwh"],
+                      "charge_mw": round(float(ch[i]), 3), "discharge_mw": round(float(dis[i]), 3),
+                      "soc_pct": round(100 * soc / E, 2)})
+    exp = sum(h["discharge_mw"] * h["price"] - h["charge_mw"] * h["price"]
+              - h["discharge_mw"] * bat["degradation_usd_mwh"] for h in hours)
+    return {"kind": kind, "date": hp[0]["ts"][:10] if hp else None, "battery": bat, "constraints": cons,
+            "hours": hours, "status": status, "expected_profit_usd": round(exp, 2)}
+
+
+def arb_baseline(prices: list[dict], battery=None) -> dict:
+    """Naive clock rule: charge at full power 01:00-05:00, discharge at full power 17:00-21:00,
+    clipped to the SOC window and so the day ends at the end SOC."""
+    bat = _battery_dict(battery)
+    hp = hourly_prices(prices)
+    eta, E, P = bat["rte"] ** 0.5, bat["energy_mwh"], bat["power_mw"]
+    lo, hi = bat["soc_min_pct"] / 100 * E, bat["soc_max_pct"] / 100 * E
+    end = bat["end_soc_pct"] / 100 * E
+    soc = bat["start_soc_pct"] / 100 * E
+    ch, dis = np.zeros(len(hp)), np.zeros(len(hp))
+    for i, p in enumerate(hp):
+        if 1 <= p["hour"] < 5:
+            ch[i] = min(P, max(0.0, hi - soc) / eta)
+        elif 17 <= p["hour"] < 21:
+            dis[i] = min(P, max(0.0, soc - max(lo, end)) * eta)
+        soc += ch[i] * eta - dis[i] / eta
+    return _arb_plan("baseline", hp, bat, {}, ch, dis, "ok")
+
+
+def arb_optimal(prices: list[dict], reserve_pct: float = 10, cycles: float = 1.0, battery=None,
+                no_discharge_before: int | None = None, no_charge_after: int | None = None) -> dict:
+    """MILP (HiGHS) over hourly prices: max sum(d*p) - sum(c*p) - deg*d.
+    s.t. soc_t = soc_{t-1} + c_t*eta - d_t/eta; max(soc_min, reserve) <= soc_t <= soc_max; soc_end = end SOC;
+    sum(d_t/eta) <= cycles * energy_mwh; c_t <= P*u_t, d_t <= P*(1-u_t), u_t binary (no simultaneous charge+discharge).
+    reserve_pct raises the floor (capped at the start SOC so the day stays feasible).
+    no_discharge_before=18 means "don't sell before 6pm"; no_charge_after blocks buying from that hour on."""
+    from scipy.optimize import Bounds, LinearConstraint, milp
+
+    bat = _battery_dict(battery)
+    hp = hourly_prices(prices)
+    cons = {"reserve_pct": reserve_pct, "cycles": cycles, "no_discharge_before": no_discharge_before,
+            "no_charge_after": no_charge_after}
+    T = len(hp)
+    eta, E, P = bat["rte"] ** 0.5, bat["energy_mwh"], bat["power_mw"]
+    floor_pct = min(max(bat["soc_min_pct"], reserve_pct), bat["start_soc_pct"], bat["end_soc_pct"])
+    lo, hi = floor_pct / 100 * E, bat["soc_max_pct"] / 100 * E
+    s0, s_end = bat["start_soc_pct"] / 100 * E, bat["end_soc_pct"] / 100 * E
+    price = np.array([p["usd_mwh"] for p in hp])
+    # x = [c_0..c_T-1, d_0..d_T-1, u_0..u_T-1]
+    c = np.concatenate([price, -(price - bat["degradation_usd_mwh"]), np.zeros(T)])  # minimize negative profit
+    ub_c = np.full(T, P)
+    ub_d = np.full(T, P)
+    for i, p in enumerate(hp):
+        if no_discharge_before is not None and p["hour"] < no_discharge_before:
+            ub_d[i] = 0.0
+        if no_charge_after is not None and p["hour"] >= no_charge_after:
+            ub_c[i] = 0.0
+    bounds = Bounds(np.concatenate([np.zeros(2 * T), np.zeros(T)]), np.concatenate([ub_c, ub_d, np.ones(T)]))
+    L = np.tril(np.ones((T, T)))  # cumulative sums -> soc_t - s0
+    Z = np.zeros((T, T))
+    I = np.eye(T)
+    A_soc = np.hstack([L * eta, -L / eta, Z])
+    A_end = np.concatenate([np.ones(T) * eta, -np.ones(T) / eta, np.zeros(T)])[None, :]
+    A_cyc = np.concatenate([np.zeros(T), np.ones(T) / eta, np.zeros(T)])[None, :]
+    A_uc = np.hstack([I, Z, -P * I])  # c - P u <= 0
+    A_ud = np.hstack([Z, I, P * I])   # d + P u <= P
+    constraints = [
+        LinearConstraint(A_soc, lo - s0, hi - s0),
+        LinearConstraint(A_end, s_end - s0, s_end - s0),
+        LinearConstraint(A_cyc, 0, cycles * E),
+        LinearConstraint(A_uc, -np.inf, 0),
+        LinearConstraint(A_ud, -np.inf, P),
+    ]
+    integrality = np.concatenate([np.zeros(2 * T), np.ones(T)])
+    res = milp(c, constraints=constraints, bounds=bounds, integrality=integrality)
+    if res.x is None:
+        return _arb_plan("optimal", hp, bat, cons, np.zeros(T), np.zeros(T), f"infeasible: {res.message}")
+    x = np.where(np.abs(res.x) < 1e-6, 0.0, res.x)
+    return _arb_plan("optimal", hp, bat, cons, x[:T], x[T:2 * T], "ok")
+
+
+def arb_simulate(plan: dict, prices: list[dict] | None = None) -> dict:
+    """Pure replay of an arbitrage plan. Settles on `prices` (any resolution, e.g. real-time 5-min, averaged
+    to hours) or, if None, on the plan's own day-ahead prices. Re-derives SOC and checks every limit."""
+    bat = plan["battery"]
+    cons = plan.get("constraints") or {}
+    eta, E, P = bat["rte"] ** 0.5, bat["energy_mwh"], bat["power_mw"]
+    floor_pct = min(max(bat["soc_min_pct"], cons.get("reserve_pct") or 0), bat["start_soc_pct"], bat["end_soc_pct"])
+    cyc_lim = cons.get("cycles", bat["max_cycles"]) if cons else bat["max_cycles"]
+    settle = {h["ts"]: h["usd_mwh"] for h in hourly_prices(prices)} if prices else {}
+    v: list[str] = []
+    soc = bat["start_soc_pct"] / 100 * E
+    socs, rev, cost, dis_cells, missing = [], 0.0, 0.0, 0.0, 0
+    for h in plan["hours"]:
+        c, d = h["charge_mw"], h["discharge_mw"]
+        if c < -1e-6 or d < -1e-6:
+            v.append(f"negative power at {h['hour']:02d}:00")
+        if c > P + 1e-6 or d > P + 1e-6:
+            v.append(f"power above {P} MW at {h['hour']:02d}:00")
+        if c > 1e-6 and d > 1e-6:
+            v.append(f"simultaneous charge and discharge at {h['hour']:02d}:00")
+        nd = cons.get("no_discharge_before")
+        if nd is not None and h["hour"] < nd and d > 1e-6:
+            v.append(f"discharge before {nd:02d}:00 at {h['hour']:02d}:00")
+        p = settle.get(h["ts"], h["price"]) if prices else h["price"]
+        if prices and h["ts"] not in settle:
+            missing += 1
+        soc += c * eta - d / eta
+        socs.append(100 * soc / E)
+        rev += d * p
+        cost += c * p
+        dis_cells += d / eta
+    for i, s in enumerate(socs):
+        if s < floor_pct - 0.05 or s > bat["soc_max_pct"] + 0.05:
+            v.append(f"SOC {s:.1f}% outside {floor_pct:.0f}-{bat['soc_max_pct']:.0f}% at {plan['hours'][i]['hour']:02d}:00")
+    end = socs[-1] if socs else bat["start_soc_pct"]
+    if abs(end - bat["end_soc_pct"]) > 0.05:
+        v.append(f"end SOC {end:.1f}% != {bat['end_soc_pct']:.0f}%")
+    cycles = dis_cells / E
+    if cycles > cyc_lim + 1e-3:
+        v.append(f"{cycles:.2f} cycles > limit {cyc_lim}")
+    if missing:
+        v.append(f"{missing} hours missing settlement prices (used plan price)")
+    deg = sum(h["discharge_mw"] for h in plan["hours"]) * bat["degradation_usd_mwh"]
+    return {
+        "kind": plan.get("kind"),
+        "settled_on": "plan" if not prices else "given prices",
+        "revenue_usd": round(rev, 2),
+        "cost_usd": round(cost, 2),
+        "degradation_usd": round(deg, 2),
+        "profit_usd": round(rev - cost - deg, 2),
+        "mwh_charged": round(sum(h["charge_mw"] for h in plan["hours"]), 2),
+        "mwh_discharged": round(sum(h["discharge_mw"] for h in plan["hours"]), 2),
+        "cycles": round(cycles, 3),
+        "min_soc": round(min(socs), 2) if socs else None,
+        "max_soc": round(max(socs), 2) if socs else None,
+        "end_soc": round(end, 2),
+        "violations": v,
+    }
+
+
+def arb_backtest(days: int = 30, end=None, reserve_pct: float = 10, cycles: float = 1.0) -> dict:
+    """Last `days` complete days (ending yesterday): plan on day-ahead, settle on real-time hourly averages."""
+    from datetime import date as _date
+
+    from grid.prices import day_ahead, real_time
+
+    end_d = _date.fromisoformat(str(end)) if end else _date.today() - timedelta(days=1)
+    out = []
+    tb = to = 0.0
+    for i in range(days):
+        d = end_d - timedelta(days=days - 1 - i)
+        da, rt = day_ahead(d), real_time(d)
+        if len(da) < 23 or len(rt) < 250:
+            continue
+        b, o = arb_baseline(da), arb_optimal(da, reserve_pct, cycles)
+        sb, so = arb_simulate(b, rt), arb_simulate(o, rt)
+        tb += sb["profit_usd"]
+        to += so["profit_usd"]
+        out.append({"date": d.isoformat(), "baseline_profit": sb["profit_usd"], "optimal_profit": so["profit_usd"],
+                    "optimal_profit_da": o["expected_profit_usd"], "cycles": so["cycles"],
+                    "violations": len([x for x in so["violations"] if "missing" not in x])})
+    return {"days": out, "totals": {"days": len(out), "baseline_profit": round(tb, 2),
+                                    "optimal_profit": round(to, 2), "uplift": round(to - tb, 2)}}

@@ -62,3 +62,26 @@ One page, dark, editorial (no rounded AI cards). Top: big "$X saved tonight / $Y
 source. Chart: tonight's NYC price curve (bars) with baseline load (red area at 7pm) vs optimal load (fills the cheap
 hours), site cap line. Safety panel: checks (all buses >= 90% by 5am, peak <= cap, simulated in Daytona: id).
 Backtest strip: 30 days of real savings. Approve button + voice playback. Link to /backend AgentGlow scene.
+
+## PIVOT (2:00pm): grid battery arbitrage replaces the bus depot as the product
+Story: "An AI trader for grid batteries: buy power when it's cheap, store it, sell it when it's expensive, inside hard
+safety limits, with a human approving." Same NYISO N.Y.C. prices, Daytona, Bedrock, voice, memory, Arize, AgentGlow.
+
+Battery `grid/battery.py` (documented constants, cite typical 4-hour NYC storage projects):
+10 MW power / 40 MWh energy, round-trip efficiency 85% (charge eff sqrt(.85), discharge eff sqrt(.85)),
+SOC limits 10%..90% (operator reserve can raise min), start/end SOC 50%, max 1 full cycle/day (warranty), degradation
+cost $8/MWh discharged, never charge and discharge in the same hour.
+
+`grid/optimize.py` (keep the old depot functions, add):
+- `arb_baseline(prices)`: naive rule: charge at full power in the 4 cheapest-by-clock hours 01:00-05:00, discharge 17:00-21:00.
+- `arb_optimal(prices, reserve_pct=10, cycles=1.0)`: LP over the 24 hourly day-ahead prices maximizing
+  sum(discharge_t*price_t) - sum(charge_t*price_t) - degradation, subject to the limits above.
+- `arb_simulate(plan, prices) -> {revenue_usd, cost_usd, profit_usd, cycles, min_soc, max_soc, end_soc, violations:[...]}`
+  (pure; runs in Daytona). Settle either on day-ahead (plan) or real-time hourly averages (what actually happened).
+- `arb_backtest(days=30)`: plan on day-ahead, settle on real-time -> per-day {date, baseline_profit, optimal_profit}.
+API: `POST /api/plan` returns arbitrage plan events (schedule [{hour, price, charge_mw, discharge_mw, soc_pct}],
+profit tonight/tomorrow, baseline profit, checks: soc within limits, <=1 cycle, no simultaneous charge/discharge,
+end SOC restored, simulated in Daytona <id>). `/api/replan {constraint}` supports e.g. "keep 30% in reserve for the
+storm", "only half a cycle today", "don't sell before 6pm". Voice tools unchanged (get_plan, replan, approve).
+UI: hero "$X profit tomorrow" + "$Y over the last 30 days"; chart: hourly price bars, green charge bars (buy) below the
+axis, gold discharge bars (sell) above, SOC line; checks; approve/talk; memory; backtest strip.
