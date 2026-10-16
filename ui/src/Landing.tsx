@@ -237,10 +237,10 @@ export function PlayTomorrow({ plan }: { plan: Plan }) {
           ) : (
             <>
               <span className="homes mono dim">~{fmtInt(peakHomes)}</span>
-              <span>NYC homes at the evening peak{sellHours.length ? `, ${hourLabel(sellHours[0])} to ${hourLabel(sellHours[sellHours.length - 1] + 1)}` : ""}</span>
+              <span>NYC homes at full sell power{sellHours.length ? ` (sells ${sellHours.map((x) => hourLabel(x)).join(", ")})` : ""}</span>
             </>
           )}
-          <span className="mono delivered">{delivered.toFixed(1)} of {totalOut.toFixed(1)} MWh delivered at the peak</span>
+          <span className="mono delivered">{delivered.toFixed(1)} of {totalOut.toFixed(1)} MWh delivered when prices peaked</span>
           <span className="fine">Assumes {HOME_KW} kW average NYC home load.</span>
         </div>
       </div>
@@ -289,7 +289,7 @@ export function ProfitCalendar({ data }: { data: Backtest | null }) {
   const weeks = Math.ceil(cells.length / 7);
   return (
     <section className="cal">
-      <div className="cal-grid" style={{ gridTemplateColumns: `28px repeat(${weeks}, 1fr)` }}>
+      <div className="cal-grid" style={{ gridTemplateColumns: `28px repeat(${weeks}, 44px)` }}>
         {["S", "M", "T", "W", "T", "F", "S"].map((d, r) => (
           <div key={`l${r}`} className="cal-dow mono" style={{ gridColumn: 1, gridRow: r + 1 }}>{d}</div>
         ))}

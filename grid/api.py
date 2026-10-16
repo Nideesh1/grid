@@ -288,7 +288,7 @@ def post_battery(req: BatteryReq):
     unchanged, except sell_above / buy_below which can be cleared with the note 'remove the price rules'."""
     from grid import profile
 
-    upd = {k: v for k, v in req.model_dump().items() if v is not None and k not in ("note", "replace")}
+    upd = {k: v for k, v in req.model_dump(exclude_unset=True).items() if k not in ("note", "replace")}  # explicit null clears a rule
     if req.note:
         upd.update(profile.parse_note(req.note))
     if not upd and not req.replace:

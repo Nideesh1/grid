@@ -55,7 +55,7 @@ def rules() -> dict:
 def _clean(upd: dict) -> dict:
     out = {}
     for k, v in upd.items():
-        if k not in DEFAULT or k == "name" and not v:
+        if k not in DEFAULT or k == "name" and not v or (v is None and k not in NUMERIC):
             continue
         if k in NUMERIC:
             out[k] = None if v in (None, "", "none") else float(v)

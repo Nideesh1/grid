@@ -246,3 +246,4 @@ nav a:hover { color: var(--green); }
 .bids .r { text-align: right; }
 .bids tr.buy .side { color: var(--green); font-weight: 600; letter-spacing: 0.1em; }
 .bids tr.sell .side { color: #f2b544; font-weight: 600; letter-spacing: 0.1em; }
+.checks li { grid-template-columns: 52px minmax(0, 1fr) minmax(0, 45%); }
